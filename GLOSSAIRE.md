@@ -1,0 +1,74 @@
+# Glossaire compact du cours
+
+Ce glossaire sert de rappel rapide. Les modules donnent les explications complètes.
+
+- **Activation** — valeur intermédiaire produite par une couche pendant le forward.
+- **Adapter** — petit ensemble de paramètres ajouté ou activé pour adapter un modèle sans réentraîner tous ses poids.
+- **AdamW** — optimizer très utilisé pour l'entraînement des Transformers.
+- **Attention mask** — masque indiquant quelles positions peuvent ou doivent être considérées.
+- **Autograd** — mécanisme de différentiation automatique de PyTorch.
+- **Autoregressive** — génération où chaque nouveau token dépend des tokens précédents.
+- **Backward pass** — calcul des gradients à partir de la loss.
+- **Batch** — groupe d'exemples traité ensemble.
+- **BF16** — format flottant 16 bits avec plage d'exposant proche de FP32, courant pour le training moderne.
+- **BPE** — méthode de tokenisation par fusions successives de fragments fréquents.
+- **Causal mask** — masque empêchant une position d'accéder aux tokens futurs pendant un LM causal.
+- **Checkpoint** — état sauvegardé permettant d'évaluer, déployer ou reprendre un entraînement.
+- **Cross-entropy** — loss couramment utilisée pour la prédiction de classes/tokens.
+- **Dataloader** — composant qui constitue et fournit les batches.
+- **DDP** — Distributed Data Parallel : réplique le modèle et répartit les données entre processus.
+- **DPO** — Direct Preference Optimization : optimisation à partir de paires chosen/rejected sans boucle RL classique avec reward model obligatoire.
+- **Embedding** — vecteur dense associé à un token ou une autre entité discrète.
+- **Epoch** — passage complet sur le dataset d'entraînement.
+- **EOS** — token marquant typiquement la fin d'une séquence.
+- **Evaluation set** — données réservées à la mesure, pas à l'optimisation des poids.
+- **Forward pass** — calcul des sorties du modèle à partir des entrées.
+- **FP16** — format flottant 16 bits utilisé pour réduire mémoire/calcul, avec contraintes de stabilité.
+- **FSDP** — Fully Sharded Data Parallel : sharde paramètres/gradients/états selon stratégie pour réduire duplication mémoire.
+- **Full fine-tuning** — entraînement de tous ou presque tous les poids d'un modèle pré-entraîné.
+- **Gradient** — dérivée locale indiquant comment la loss varie par rapport à un paramètre.
+- **Gradient accumulation** — accumulation de gradients sur plusieurs micro-batches avant un optimizer step.
+- **Gradient checkpointing** — économie d'activations en les recalculant pendant le backward.
+- **GRPO** — famille d'optimisation RL utilisant des récompenses relatives au sein d'un groupe de générations.
+- **Hidden state** — représentation interne produite par le réseau pour une position/couche.
+- **Inference** — utilisation d'un modèle sans mise à jour de ses poids.
+- **KL divergence** — mesure asymétrique d'écart entre distributions, souvent utilisée pour contrôler la dérive d'une policy.
+- **KV cache** — cache des keys/values d'attention passées pour accélérer la génération autoregressive.
+- **Label** — cible utilisée dans le calcul de loss.
+- **Learning rate** — échelle des mises à jour effectuées par l'optimizer.
+- **LM head** — projection des hidden states vers un score par token du vocabulaire.
+- **Logit** — score brut avant conversion en distribution de probabilité.
+- **LoRA** — adaptation low-rank qui apprend de petites matrices plutôt que la matrice de poids complète.
+- **Loss** — fonction scalaire mesurant l'erreur selon l'objectif d'entraînement.
+- **Mixed precision** — calcul utilisant plusieurs précisions numériques pour améliorer mémoire/performance.
+- **Optimizer** — algorithme qui transforme gradients et état interne en mises à jour des paramètres.
+- **Overfitting** — amélioration sur train accompagnée d'une généralisation insuffisante hors train.
+- **Packing** — regroupement de plusieurs exemples courts afin d'utiliser davantage de positions d'une séquence d'entraînement.
+- **Parameter** — nombre appris et persistant du modèle.
+- **PEFT** — Parameter-Efficient Fine-Tuning : méthodes qui entraînent une petite fraction ou structure additionnelle de paramètres.
+- **Perplexity** — exponentielle de la cross-entropy moyenne dans un cadre LM; utile mais dépend fortement des données/tokenizer.
+- **Policy** — en RL, distribution d'actions; pour un LLM, distribution de générations conditionnée par le contexte.
+- **PPO** — Proximal Policy Optimization : méthode RL limitant les mises à jour trop éloignées de la policy précédente.
+- **Pretraining** — apprentissage initial, souvent causal, sur un grand corpus avant instruction tuning.
+- **QLoRA** — LoRA entraîné au-dessus d'un modèle de base quantifié et gelé, typiquement en 4 bits.
+- **Quantization** — représentation de poids/activations avec moins de bits ou une forme numérique plus compacte.
+- **Reward** — signal scalaire indiquant la qualité d'un résultat selon une fonction donnée.
+- **Reward model** — modèle appris qui attribue une reward à une réponse/paire contexte-réponse.
+- **RoPE** — Rotary Position Embedding : mécanisme positionnel fréquent dans les LLM modernes.
+- **Sampling** — tirage d'un token selon une distribution plutôt que choix systématique de l'argmax.
+- **Scheduler** — règle faisant varier le learning rate au cours du training.
+- **Seed** — graine pseudo-aléatoire utilisée pour améliorer la reproductibilité.
+- **Sequence length** — nombre de positions/tokens d'une séquence traitée.
+- **SFT** — Supervised Fine-Tuning sur des sorties cibles connues.
+- **Softmax** — transforme des logits en distribution positive sommant à 1.
+- **Step** — itération d'entraînement; préciser si micro-step ou optimizer step.
+- **Tensor** — tableau multidimensionnel numérique manipulé par le framework.
+- **Token** — unité discrète produite par un tokenizer.
+- **Token ID** — entier indexant un token dans le vocabulaire.
+- **Tokenizer** — transforme texte ↔ séquence de tokens/IDs selon des règles apprises/fixées.
+- **Top-k** — restriction du sampling aux k tokens les mieux scorés.
+- **Top-p** — restriction à un ensemble minimal de tokens couvrant une probabilité cumulée choisie.
+- **Training** — processus qui modifie les paramètres afin de réduire/optimiser un objectif.
+- **Validation set** — données hors entraînement utilisées pour suivre généralisation et choisir des réglages.
+- **VRAM** — mémoire du GPU.
+- **Weight decay** — forme de régularisation intégrée à des optimizers comme AdamW.

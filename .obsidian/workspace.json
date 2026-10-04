@@ -1,0 +1,220 @@
+{
+  "main": {
+    "id": "59f7ffe5038db776",
+    "type": "split",
+    "children": [
+      {
+        "id": "fc691dbf2c068184",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "dbe8d126bfb82c6a",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "INDEX.md",
+                "mode": "source",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "INDEX"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "vertical"
+  },
+  "left": {
+    "id": "40a4f06e4201fd12",
+    "type": "split",
+    "children": [
+      {
+        "id": "d613488abfd9e4c3",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "fa2b1813609002e4",
+            "type": "leaf",
+            "state": {
+              "type": "file-explorer",
+              "state": {
+                "sortOrder": "alphabetical",
+                "autoReveal": false,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-folder-closed",
+              "title": "Files"
+            }
+          },
+          {
+            "id": "7e24102d879cb93e",
+            "type": "leaf",
+            "state": {
+              "type": "search",
+              "state": {
+                "query": "",
+                "matchingCase": false,
+                "explainSearch": false,
+                "collapseAll": false,
+                "extraContext": false,
+                "sortOrder": "alphabetical"
+              },
+              "icon": "lucide-search",
+              "title": "Search"
+            }
+          },
+          {
+            "id": "c75b7a3d6e25e6d3",
+            "type": "leaf",
+            "state": {
+              "type": "bookmarks",
+              "state": {
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-bookmark",
+              "title": "Bookmarks"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "horizontal",
+    "width": 300
+  },
+  "right": {
+    "id": "574bb443c06b2161",
+    "type": "split",
+    "children": [
+      {
+        "id": "bfa1a6a96c4d0807",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "a481d291c9c7a689",
+            "type": "leaf",
+            "state": {
+              "type": "backlink",
+              "state": {
+                "file": "INDEX.md",
+                "collapseAll": false,
+                "extraContext": false,
+                "sortOrder": "alphabetical",
+                "showSearch": false,
+                "searchQuery": "",
+                "backlinkCollapsed": false,
+                "unlinkedCollapsed": true
+              },
+              "icon": "links-coming-in",
+              "title": "Backlinks"
+            }
+          },
+          {
+            "id": "eac89257f567046c",
+            "type": "leaf",
+            "state": {
+              "type": "outgoing-link",
+              "state": {
+                "file": "INDEX.md",
+                "linksCollapsed": false,
+                "unlinkedCollapsed": true
+              },
+              "icon": "links-going-out",
+              "title": "Outgoing links"
+            }
+          },
+          {
+            "id": "3b515d9fe899cf57",
+            "type": "leaf",
+            "state": {
+              "type": "tag",
+              "state": {
+                "sortOrder": "frequency",
+                "useHierarchy": true,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-tags",
+              "title": "Tags"
+            }
+          },
+          {
+            "id": "efd6c433a382174b",
+            "type": "leaf",
+            "state": {
+              "type": "all-properties",
+              "state": {
+                "sortOrder": "frequency",
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-archive",
+              "title": "All properties"
+            }
+          },
+          {
+            "id": "f4ff24148a3a14bc",
+            "type": "leaf",
+            "state": {
+              "type": "outline",
+              "state": {
+                "file": "INDEX.md",
+                "followCursor": false,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-list",
+              "title": "Outline"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "horizontal",
+    "width": 300,
+    "collapsed": true
+  },
+  "left-ribbon": {
+    "hiddenItems": {
+      "switcher:Open quick switcher": false,
+      "graph:Open graph view": false,
+      "canvas:Create new canvas": false,
+      "daily-notes:Open today's daily note": false,
+      "templates:Insert template": false,
+      "command-palette:Open command palette": false,
+      "bases:Create new base": false
+    }
+  },
+  "active": "dbe8d126bfb82c6a",
+  "lastOpenFiles": [
+    "GLOSSAIRE.md",
+    "62_projet_7_llm_from_scratch_de_bout_en_bout.md",
+    "SOURCES_ET_API.md",
+    "README.md",
+    "INDEX.md",
+    "01_pipeline_complet_dun_llm.md",
+    "00_METHODE_ET_ENVIRONNEMENT.md",
+    "38_entrainer_un_tokenizer_bpe.md",
+    "28_entrainer_avec_dpotrainer.md",
+    "25_continued_pretraining.md",
+    "23_gradient_accumulation_et_batch_effectif.md",
+    "22_full_ft_configuration_stable.md",
+    "21_full_fine_tuning_principe.md",
+    "40_concevoir_un_petit_transformer.md",
+    "46_deduplication_exacte_et_near_duplicate.md",
+    "52_logging_et_tensorboard.md",
+    "54_comparer_scientifiquement_des_entrainements.md",
+    "24_gradient_checkpointing_et_memoire.md",
+    "14_surapprentissage_et_generalisation.md",
+    "08_premiere_boucle_dentrainement_pytorch.md",
+    "07_gradients_et_autograd.md",
+    "06_loss_et_prediction_du_prochain_token.md",
+    "05_parametres_et_memoire_des_poids.md",
+    "04_anatomie_du_transformer.md",
+    "03_fenetre_de_contexte_et_sequences.md",
+    "02_tokenisation_en_profondeur.md"
+  ]
+}
