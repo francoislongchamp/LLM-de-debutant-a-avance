@@ -1,134 +1,177 @@
-# Module 44 — Perplexité et ses limites
+# Module 44 — Calculer la perplexité avec le bon dénominateur
 
-## Pourquoi ce module arrive ici
+## 1. Ce que tu vas apprendre
 
-La perplexité est une transformation intuitive de la loss de langage, souvent utilisée pour comparer la capacité prédictive sur un corpus. Elle est néanmoins facile à mal comparer entre tokenizers ou distributions.
+La perplexité, ou **PPL**, est l’exponentielle d’une NLL moyenne dans un protocole de modèle de langage causal. Elle ne constitue pas une note universelle de chat.
 
-## Objectifs
+Tu vas agréger des losses par cible, distinguer moyenne avant/après exponentielle et comprendre l’effet des fenêtres d’évaluation.
 
-Calculer perplexité depuis une cross-entropy moyenne, comprendre son intuition et connaître les conditions qui rendent les comparaisons trompeuses.
+**Prérequis :** modules 6, 42 et 43.
 
-**Prérequis :** Les modules précédents.  
-**Temps indicatif :** 45 à 90 minutes, laboratoire compris.  
-**Niveau :** Pré-entraînement — évaluation
+**Temps indicatif :** 90 à 120 minutes.
 
-## Définitions concrètes
+**Matériel :** Python uniquement pour les calculs et fenêtres.
 
-### Perplexity / PPL
+## 2. De la NLL à la perplexité
 
-**Définition concrète.** Exponentielle de la cross-entropy moyenne en nats pour un modèle de langage.
-
-
-**Exemple simple.** loss=2 → PPL≈7.39.
-
-### Evaluation corpus
-
-**Définition concrète.** Corpus fixe sur lequel la loss/PPL est calculée.
-
-
-**Exemple simple.** Validation holdout du domaine.
-
-### Tokenization dependence
-
-**Définition concrète.** La loss est définie par token; changer la tokenisation change l’unité de mesure.
-
-
-**Exemple simple.** Deux tokenizers rendent une PPL brute difficile à comparer directement.
-
-### Domain dependence
-
-**Définition concrète.** Une PPL est spécifique à une distribution.
-
-
-**Exemple simple.** Un modèle code peut avoir mauvaise PPL sur poésie et inversement.
-
-## Intuition simple
-
-PPL est parfois décrite comme un “nombre effectif de choix” moyen, mais cette intuition est approximative. Mathématiquement, retiens surtout qu’elle est une transformation monotone de la loss : plus la cross-entropy baisse, plus la PPL baisse.
-
-## Ce qui se passe réellement sous le capot
-
-1. Calculer la cross-entropy moyenne sur le corpus d’évaluation sans gradient.
-2. Exponentier la valeur si elle est exprimée avec logarithme naturel.
-3. Comparer seulement des runs sur une base compatible.
-4. Rapporter le corpus, tokenizer et protocole.
-5. Compléter par des benchmarks de comportement si le but est un assistant.
-
-## Exemple minimal à comprendre mentalement
-
-```text
-loss 3.0 → PPL ≈ 20.09
-loss 2.0 → PPL ≈ 7.39
-loss 1.0 → PPL ≈ 2.72
-```
-
-Le classement par PPL est le même que par loss, car exp est monotone.
-
-## Formules et notation utiles
+Avec N cibles actives et logarithme naturel :
 
 \[
-PPL=e^{L}
+L = \frac{1}{N}\sum_t -\ln p(x_t|contexte_t),\qquad PPL=\exp(L)
 \]
 
-si `L` est la cross-entropy moyenne utilisant le logarithme naturel.
+| NLL moyenne | PPL environ |
+| --- | --- |
+| 3 | 20.0855 |
+| 2 | 7.3891 |
+| 1 | 2.7183 |
 
-## Code minimal observable
+L’exponentielle est monotone : PPL et loss ordonnent les checkpoints de la même façon **sur le même protocole**. PPL n’ajoute pas une seconde preuve indépendante.
+
+Pour un vocabulaire uniforme de V tokens, la NLL vaut ln(V) et PPL=V. L’interprétation comme « choix effectifs » est une intuition, pas un comptage littéral de candidats à chaque token.
+
+## 3. Agréger avant d’exponentier
+
+Supposons un batch de 2 cibles avec loss moyenne 1 et un batch de 8 cibles avec loss moyenne 3 :
+
+```text
+NLL globale : (2×1 + 8×3)/10 = 2.6
+PPL globale : exp(2.6) ≈ 13.4637
+```
+
+Ni la moyenne simple des losses ni la moyenne des perplexités de batches ne reproduisent cette valeur.
+
+Exclus les cibles ignorées du dénominateur. Si aucune cible n’est active, une PPL de corpus n’a pas de définition utile pour ce calcul ; il faut signaler le problème.
+
+## 4. Laboratoire A — Retrouver trois nombres différents
 
 ```python
 import math
-for loss in [3.0,2.0,1.0]:
-    print(loss, math.exp(loss))
+
+batches = [{'loss': 1.0, 'targets': 2}, {'loss': 3.0, 'targets': 8}]
+count = sum(row['targets'] for row in batches)
+if count == 0:
+    raise ValueError('Aucune cible')
+mean_nll = sum(row['loss'] * row['targets'] for row in batches) / count
+ppl = math.exp(mean_nll)
+wrong_unweighted = math.exp(sum(row['loss'] for row in batches) / len(batches))
+mean_batch_ppl = sum(math.exp(row['loss']) for row in batches) / len(batches)
+print('NLL et PPL globales :', mean_nll, ppl)
+print('Exponentielle moyenne non ponderee :', wrong_unweighted)
+print('Moyenne des PPL de batches :', mean_batch_ppl)
+print('PPL pour loss 1.5 :', math.exp(1.5))
 ```
 
-## Laboratoire guidé
+Les valeurs attendues sont environ **13.4637**, **7.3891** et **11.4019**, puis **4.4817** pour la dernière ligne.
 
-1. Calcule val loss et PPL à plusieurs checkpoints.  
-2. Vérifie qu’elles ordonnent les checkpoints pareil.  
-3. Évalue sur deux domaines différents.  
-4. Si tu as deux tokenizers différents, résiste à la tentation de comparer directement la PPL brute; explique pourquoi.  
-5. Compare PPL avec un benchmark d’instruction après SFT.
+Si l’exponentielle déborde sur une NLL très élevée, conserve la NLL et signale le débordement au lieu de présenter un nombre artificiellement plafonné comme la vraie PPL.
 
-## Ce que tu dois observer
+## 5. Le contexte d’évaluation change la mesure
 
-- PPL est très sensible au corpus.
-- Une base model avec bonne PPL n’est pas automatiquement un bon assistant.
-- La PPL n’ajoute pas d’information mathématique indépendante à la loss correspondante; elle change l’échelle.
+Un modèle à contexte limité ne peut pas utiliser tout le passé d’un très long document. Le découper en blocs disjoints retire du contexte à certaines cibles et peut omettre des prédictions aux frontières.
 
-## À ne pas confondre
+Une stratégie glissante permet de fournir davantage de contexte, mais il faut éviter de compter les mêmes cibles plusieurs fois. La PPL doit annoncer longueur de fenêtre, stride, frontières de documents et traitement des tokens spéciaux.
 
-- PPL ≠ pourcentage.
-- PPL basse ≠ vérité factuelle garantie.
-- PPL de tokenizers différents ≠ comparaison triviale.
+## 6. Laboratoire B — Une cible par fenêtre glissante
 
-## Erreurs fréquentes
+Cette version pédagogique montre les indices. Elle ne calcule pas de logits ; dans un vrai modèle, seuls les labels de la dernière position resteraient actifs pour chaque fenêtre ci-dessous.
 
-- Annoncer une PPL sans corpus/protocole.
-- Utiliser PPL comme seule métrique d’un chat model.
-- Comparer des évaluations avec masking différent.
+```python
+tokens = list(range(9))
+context_length = 4
+counted_targets = []
+for end in range(2, len(tokens) + 1):
+    begin = max(0, end - context_length)
+    input_ids = tokens[begin:end]
+    labels = [-100] * (len(input_ids) - 1) + [tokens[end - 1]]
+    counted_targets.append(end - 1)
+    print('positions=', (begin, end), 'entree=', input_ids, 'labels=', labels)
+assert counted_targets == list(range(1, len(tokens)))
+print('Cibles comptees une fois :', counted_targets)
+```
 
-## Exercices
+Les positions **1 à 8** sont chacune comptées une fois. La position 0 ne possède pas de préfixe fourni ici. La dernière cible de chaque fenêtre est prédite par la position précédente après décalage interne.
 
-1. Calcule PPL pour loss 1.5.
-2. Explique pourquoi deux tokenizers compliquent la comparaison.
-3. Donne un cas où PPL domaine s’améliore mais instruction following ne change pas.
+Cette stratégie fait beaucoup de forwards pour peu de cibles. Des implémentations à stride plus grand évaluent plusieurs nouvelles cibles à la fois ; elles doivent masquer celles déjà évaluées et utiliser le dénominateur réel.
 
-## Validation — avant de continuer
+## 7. Comparabilité entre modèles
 
-Tu dois pouvoir, sans simplement réciter le code :
+Une PPL par token dépend du tokenizer. La même chaîne découpée en dix ou vingt unités ne définit pas le même nombre de termes ni la même tâche locale.
 
-- Calculer PPL.
-- Expliquer son intuition et ses limites.
-- Dire quelles informations accompagner d’une valeur de PPL.
-- Ne pas la confondre avec une évaluation de chat.
+Une mesure en bits par octet peut aider certaines comparaisons de vraisemblance sur exactement les mêmes textes et conventions, mais elle demande elle aussi des détails de segmentation, contexte et normalisation. Ne convertis pas une PPL brute en classement universel.
+
+Pour un assistant, ajoute respect des instructions, exactitude et benchmark de régression. Une bonne modélisation de documents ne certifie pas une réponse fidèle ou une citation correcte.
+
+## 8. Expériences guidées
+
+1. Recalcule la NLL de validation du module 42 à partir des sommes et nombres de cibles, puis exponentie.
+2. Compare fenêtres disjointes et glissantes sur le même document. Liste d’abord les cibles et leurs contextes avant de comparer les valeurs.
+3. Modifie le masque de loss d’une mesure et explique pourquoi la PPL obtenue ne porte plus exactement sur la même distribution de cibles.
+4. Rapporte une PPL avec corpus/révision, tokenizer, contexte, stride, masque et unité de moyenne.
+
+## 9. Exercices avec corrigés
+
+### Exercice 1 — Interprétation
+
+PPL=8 signifie-t-il 8 % d’erreurs ?
+
+<details>
+<summary>Corrigé</summary>
+
+Non. C’est exp(NLL moyenne) dans le protocole décrit, pas un pourcentage d’accuracy ou d’erreur.
+
+</details>
+
+### Exercice 2 — Même classement
+
+Sur la même validation, loss A=1.2 et B=1.4 : laquelle a la PPL la plus basse ?
+
+<details>
+<summary>Corrigé</summary>
+
+A, car l’exponentielle est croissante. Cela ne rajoute pas une métrique indépendante à ces losses.
+
+</details>
+
+### Exercice 3 — Fenêtre
+
+Pourquoi deux évaluations avec contexte 32 et 128 peuvent-elles donner des PPL différentes sur les mêmes textes ?
+
+<details>
+<summary>Corrigé</summary>
+
+Les probabilités des cibles dépendent du contexte disponible. Le nombre de cibles et le traitement des frontières peuvent aussi différer.
+
+</details>
+
+### Exercice 4 — Tokenizers
+
+Une PPL plus basse avec un autre tokenizer prouve-t-elle un meilleur assistant ?
+
+<details>
+<summary>Corrigé</summary>
+
+Non. L’unité de prédiction et le protocole ont changé ; les qualités d’assistant demandent en plus des tâches et mesures appropriées.
+
+</details>
+
+## 10. Validation — avant de continuer
+
+- [ ] Je calcule exp(NLL moyenne pondérée par les cibles).
+- [ ] Je distingue trois agrégations du laboratoire A.
+- [ ] Je vérifie qu’une cible glissante n’est comptée qu’une fois.
+- [ ] Je décris contexte, frontières et tokenizer.
+- [ ] Je sais ce qu’une PPL ne dit pas sur un assistant.
 
 ## Fiche mémo
 
-Perplexité est `exp(loss)` sur un protocole donné : utile pour la modélisation de langage, insuffisante pour résumer toutes les capacités.
+```text
+Additionner les NLL ; compter les cibles ; diviser ; exponentier.
+Une PPL n’a de sens qu’avec son protocole de contexte et de tokenisation.
+```
 
-## Lien avec le module suivant
+Le [module 45](45_pipeline_de_donnees_de_pre_entrainement.md) prépare les corpus qui alimentent ces mesures.
 
-Le module 45 revient en amont : comment transformer des sources brutes en corpus fiable à grande échelle.
+## Référence
 
----
-
-> **Règle de progression :** si un point de la validation n’est pas clair, refais le micro-exemple et le laboratoire. Le but est de construire un modèle mental solide, pas d’accumuler des commandes.
+[Transformers : perplexité et fenêtres fixes](https://huggingface.co/docs/transformers/en/perplexity).

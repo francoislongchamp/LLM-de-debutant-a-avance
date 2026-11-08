@@ -1,151 +1,160 @@
-# Module 43 — Lire les courbes de loss
+# Module 43 — Lire une courbe et retrouver les données qui l’expliquent
 
-## Pourquoi ce module arrive ici
+## 1. Ce que tu vas apprendre
 
-Une loss qui descend est nécessaire mais pas suffisante. Sa forme, l’écart train/validation, les spikes, les plateaux et les changements liés au LR racontent ce qui arrive au training.
+Une loss qui baisse ne dit pas seule pourquoi le modèle progresse. Un pic, un plateau ou un changement de masque peut modifier la courbe sans avoir la même signification.
 
-## Objectifs
+Tu vas conserver la série brute, calculer un lissage causal et relier les anomalies à un batch, un LR et un compteur de cibles.
 
-Reconnaître baisse normale, plateau, divergence, spikes, overfitting et ruptures de pipeline. Corréler loss avec LR, grad norm, données et throughput.
+**Prérequis :** modules 13, 14, 22 et 42.
 
-**Prérequis :** Les modules précédents.  
-**Temps indicatif :** 45 à 90 minutes, laboratoire compris.  
-**Niveau :** Pré-entraînement — diagnostic
+**Temps indicatif :** 90 à 150 minutes.
 
-## Définitions concrètes
+**Matériel :** Python uniquement pour l’analyse ; aucun entraînement.
 
-### Learning curve
+## 2. Définir les axes avant la forme
 
-**Définition concrète.** Évolution d’une métrique selon steps/tokens.
+| Axe horizontal | Utile pour | Attention |
+| --- | --- | --- |
+| Optimizer steps | Dynamique des updates | Un batch logique peut changer de taille |
+| Cibles/tokens traités | Budget de données exposées | Convention et répétitions à annoncer |
+| Temps réel | Coût de l’expérience | Inclut attentes, évaluation et matériel |
+| Epochs | Parcours d’un corpus fixe | Peu comparable entre mixtures ou corpus différents |
 
+Sur l’axe vertical, précise la loss, les cibles et la moyenne. Une nouvelle règle assistant-only peut réduire la loss affichée parce que l’on mesure autre chose, sans démontrer une amélioration instantanée.
 
-**Exemple simple.** Train loss vs tokens vus.
+## 3. Reconnaître des formes, pas inventer une cause
 
-### Plateau
+| Forme observée | Hypothèses de départ | Vérification |
+| --- | --- | --- |
+| Plateau | LR, capacité, données ou convergence | LR effectif, test un batch, validation |
+| Pic isolé puis retour | Batch difficile, longueur, corruption ou instabilité passagère | IDs, source, labels et norme |
+| Hausse durable | Dérive numérique ou updates inadaptées | Premier point anormal et état précédent |
+| Train baisse, validation remonte | Suradaptation ou protocole différent | Splits, objectifs et checkpoints |
+| Rupture au changement de source | Mixture ou difficulté modifiée | Source et compteurs par domaine |
 
-**Définition concrète.** Zone où la métrique n’améliore presque plus.
+Une corrélation temporelle aide à choisir quoi inspecter ; elle ne prouve pas la causalité. Un pic de grad_norm peut aussi dépendre de l’échelle de la loss ou du nombre de cibles.
 
+## 4. Lisser sans effacer les faits
 
-**Exemple simple.** Peut venir du LR, du modèle, des données ou simplement d’une convergence locale.
+Une moyenne glissante sur les k dernières observations réduit le bruit visuel. Elle retarde aussi la lecture des changements et peut cacher des pics courts.
 
-### Spike
+Conserve la série brute et indique fenêtre/convention. Une moyenne non pondérée de losses de batches n’est pas forcément la loss moyenne par cible si les effectifs varient.
 
-**Définition concrète.** Hausse brève et importante de loss/grad norm.
+Pour une courbe de corpus pondérée, conserve sommes NLL et nombres de cibles puis agrège leurs sommes. Le lissage est une aide de visualisation, pas une nouvelle preuve de qualité.
 
+## 5. Laboratoire autonome — Retrouver un pic et son batch
 
-**Exemple simple.** Batch difficile/corrompu ou instabilité.
-
-### Divergence
-
-**Définition concrète.** Détérioration persistante ou valeurs non finies.
-
-
-**Exemple simple.** Loss qui explose.
-
-### Smoothing
-
-**Définition concrète.** Moyenne glissante pour visualiser une tendance.
-
-
-**Exemple simple.** À utiliser sans cacher les spikes bruts.
-
-## Intuition simple
-
-Une courbe de loss est un électrocardiogramme du training : elle ne donne pas un diagnostic complet, mais des changements de forme orientent les vérifications à faire.
-
-## Ce qui se passe réellement sous le capot
-
-1. Logger loss brute et moyenne glissante.
-2. Logger validation à intervalles réguliers.
-3. Superposer ou corréler LR et grad norm.
-4. Lors d’un spike, identifier les batch IDs/tokens si possible.
-5. Lors d’un plateau, vérifier LR, données, capacité et validation.
-6. Lors d’une divergence, stopper et inspecter le dernier état stable.
-
-## Exemple minimal à comprendre mentalement
-
-```text
-step 0    9.7
-100       7.3
-500       5.4
-1000      4.8
-1500      4.7
-2000      8.9  <- spike
-2100      4.6
-```
-
-Un spike isolé suivi d’un retour n’a pas la même signification qu’une hausse persistante vers NaN.
-
-## Formules et notation utiles
-
-Moyenne glissante simple sur fenêtre k :
-
-\[
-\bar L_t=\frac1k\sum_{i=t-k+1}^{t}L_i
-\]
-
-Toujours conserver la série brute pour ne pas masquer les anomalies.
-
-## Code minimal observable
+Les données sont fictives et leur metadata fait partie de l’exercice. L’heuristique compare la loss courante à la moyenne des trois précédentes ; elle ne diagnostique pas automatiquement un bug.
 
 ```python
-losses=[9.7,8.2,7.3,6.0,5.4,8.9,5.1]
-window=3
-for i in range(window-1,len(losses)):
-    avg=sum(losses[i-window+1:i+1])/window
-    print(i, avg)
+import statistics
+
+losses = [9.7, 8.2, 7.3, 6.0, 5.4, 8.9, 5.1, 4.9]
+rows = [{'step': i, 'loss': loss, 'lr': 0.001,
+         'batch_id': f'batch-{i:02d}', 'targets': 100,
+         'grad_norm': 20.0 if i == 5 else 1.0}
+        for i, loss in enumerate(losses)]
+window = 3
+flagged = []
+for index, row in enumerate(rows):
+    recent = rows[max(0, index - window + 1):index + 1]
+    smoothed = statistics.mean(item['loss'] for item in recent)
+    previous = rows[max(0, index - window):index]
+    deviation = row['loss'] - statistics.mean(item['loss'] for item in previous) if len(previous) == window else None
+    if deviation is not None and deviation > 2.0:
+        flagged.append(row)
+    print(row['step'], 'brut=', row['loss'], 'lisse=', round(smoothed, 3),
+          'ecart aux precedents=', None if deviation is None else round(deviation, 3))
+print('A inspecter :', flagged)
+
+batches = [{'mean_loss': 1.0, 'targets': 2}, {'mean_loss': 3.0, 'targets': 8}]
+weighted = sum(row['mean_loss'] * row['targets'] for row in batches) / sum(row['targets'] for row in batches)
+unweighted = statistics.mean(row['mean_loss'] for row in batches)
+print('Moyenne par cible :', weighted, 'moyenne par batch :', unweighted)
 ```
 
-## Laboratoire guidé
+Tu dois retrouver le **step 5**, `batch-05`, sa loss **8.9** et sa norme **20**. La mesure revient ensuite vers le niveau précédent : ce n’est pas la même histoire qu’une hausse persistante jusqu’à NaN.
 
-1. Sauvegarde loss/LR/grad_norm par step.  
-2. Produit courbe brute et lissée.  
-3. Ajoute val loss.  
-4. Pour le plus gros spike, retrouve le batch si ton pipeline le permet.  
-5. Fais une courte expérience avec LR trop élevé afin de reconnaître la divergence, puis jette ce checkpoint.  
-6. Écris un diagnostic pour trois formes de courbe.
+Les deux moyennes finales valent **2.6** par cible et **2.0** par batch. Ce sont deux pondérations différentes, pas un arrondi.
 
-## Ce que tu dois observer
+## 6. Une procédure de diagnostic reproductible
 
-- Les batchs ont une difficulté variable, donc loss bruitée est normale.
-- La validation peut se détériorer malgré train loss descendante.
-- Un changement de pipeline de données peut créer une rupture de courbe.
+1. Retrouve le premier événement suspect et les mesures brutes.
+2. Vérifie configuration, code, données et éventuels changements à cet instant.
+3. Rejoue un batch identifié dans des conditions contrôlées si les données peuvent être conservées.
+4. Sépare effet de données, calcul numérique et update en examinant chaque étape.
+5. Compare au checkpoint précédent et à la validation.
+6. Change un facteur à la fois dans un pilote court.
 
-## À ne pas confondre
+Évite de modifier plusieurs réglages dans le run principal sans noter la rupture. Les courbes après intervention ne sont plus celles de la seule configuration initiale.
 
-- Plateau ≠ preuve que le modèle est “plein”.
-- Spike ≠ divergence nécessairement.
-- Smoothing ≠ nouvelle métrique.
+## 7. Expériences guidées
 
-## Erreurs fréquentes
+- Augmente la fenêtre de lissage à 5 et compare la visibilité du pic sans supprimer la série brute.
+- Change seulement le nombre de cibles de certains points et recalcule une moyenne de corpus pondérée.
+- Ajoute une colonne `source` et un changement de mixture au step 5. Décris ce qu’il faudrait tester pour attribuer le pic à la source.
+- Sur le pilote 42, archive loss, LR utilisé, norme pré-clipping et cibles par update, puis compare train et validation selon des conventions compatibles.
 
-- Ne logger que toutes les plusieurs milliers de steps et manquer les anomalies.
-- Lisser tellement qu’on cache les spikes.
-- Modifier scheduler en cours de run sans noter la rupture.
+## 8. Exercices avec corrigés
 
-## Exercices
+### Exercice 1 — Plateau
 
-1. Décris le diagnostic d’un train loss↓ / val loss↑.
-2. Décris le diagnostic d’un loss et grad norm qui deviennent NaN.
-3. Explique pourquoi tokens vus est parfois un meilleur axe x que epochs.
+Une courbe plate prouve-t-elle que le modèle a atteint sa capacité maximale ?
 
-## Validation — avant de continuer
+<details>
+<summary>Corrigé</summary>
 
-Tu dois pouvoir, sans simplement réciter le code :
+Non. LR, données, masques, optimizer ou problème de pipeline peuvent aussi produire un plateau. Il faut des vérifications ciblées.
 
-- Reconnaître plateau/spike/divergence/overfit.
-- Corréler loss et LR/grad norm.
-- Conserver données brutes et lissées.
-- Proposer une investigation plutôt qu’un diagnostic magique.
+</details>
+
+### Exercice 2 — Lissage
+
+Pourquoi garder les points bruts si une moyenne est plus lisible ?
+
+<details>
+<summary>Corrigé</summary>
+
+Le lissage peut cacher des anomalies brèves et déplacer visuellement leur début. Les valeurs brutes permettent de retrouver le batch et les circonstances exactes.
+
+</details>
+
+### Exercice 3 — Axe steps
+
+Deux runs font 1 000 updates avec des batches effectifs différents. Ont-ils vu autant de données ?
+
+<details>
+<summary>Corrigé</summary>
+
+Pas nécessairement. Il faut compter entrées et cibles réelles, avec la même convention, ainsi que les répétitions.
+
+</details>
+
+### Exercice 4 — Norme et clipping
+
+La norme loggée vaut 20 alors que le clipping est à 1. Est-ce forcément un échec ?
+
+<details>
+<summary>Corrigé</summary>
+
+Non. Le framework peut logger la norme avant clipping, comme `clip_grad_norm_` la renvoie. Vérifie le moment de mesure.
+
+</details>
+
+## 9. Validation — avant de continuer
+
+- [ ] Je nomme axes, objectifs, masques et moyenne.
+- [ ] Je distingue pic, plateau, rupture et divergence persistante.
+- [ ] Je retrouve le batch suspect du laboratoire.
+- [ ] Je garde série brute et lissage avec leur convention.
+- [ ] Je propose une investigation plutôt qu’une cause certaine sans preuve.
 
 ## Fiche mémo
 
-Une courbe ne répond pas seule, mais elle te dit **où regarder** dans les données, l’optimizer ou la stabilité.
+```text
+Une courbe indique où regarder ; elle n’identifie pas seule la cause.
+Relier chaque point aux cibles, au LR, aux gradients et aux données.
+```
 
-## Lien avec le module suivant
-
-Le module 44 convertit la cross-entropy en perplexité et explique pourquoi cette métrique est utile mais limitée.
-
----
-
-> **Règle de progression :** si un point de la validation n’est pas clair, refais le micro-exemple et le laboratoire. Le but est de construire un modèle mental solide, pas d’accumuler des commandes.
+Le [module 44](44_perplexite_et_ses_limites.md) transforme la même NLL moyenne en perplexité.

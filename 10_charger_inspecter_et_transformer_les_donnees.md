@@ -1,163 +1,221 @@
-# Module 10 — Charger, inspecter et transformer les données
+# Module 10 — Charger, inspecter et transformer des données
 
-## Pourquoi ce module arrive ici
+## 1. Ce que tu vas apprendre
 
-Un dataset réel doit être chargé, filtré, transformé et parfois tokenisé. Chaque transformation peut supprimer ou altérer des exemples; il faut donc rendre ces opérations observables et reproductibles.
+Au [module 9](09_construire_un_dataset_de_qualite.md), tu as vérifié les exemples un par un. Ici, tu vas transformer une collection avec Hugging Face Datasets tout en gardant des comptes explicables.
 
-## Objectifs
+À la fin, tu pourras charger du JSONL, lire un schéma, ajouter des colonnes avec `map`, sélectionner avec `filter` et `select`, mélanger avec une seed et vérifier une sauvegarde.
 
-Utiliser `datasets` pour charger JSON/JSONL, inspecter features, `map`, `filter`, `select`, `shuffle` et sauvegarder. Comprendre transformation paresseuse vs matérialisée au niveau conceptuel et éviter les mutations opaques.
+**Prérequis :** module 9 ; listes, dictionnaires et fonctions Python.
 
-**Prérequis :** Les modules précédents.  
-**Temps indicatif :** 45 à 90 minutes, laboratoire compris.  
-**Niveau :** Fine-tuning — données
+**Temps indicatif :** 90 à 150 minutes.
 
-## Définitions concrètes
+**Matériel :** Python et `datasets` ; CPU, sans téléchargement de modèle. Si nécessaire : `python -m pip install datasets` dans ton environnement du cours.
 
-### Dataset
+## 2. Une table d’exemples, pas un modèle
 
-**Définition concrète.** Collection structurée d’exemples accessible par colonnes et lignes.
+Un objet `Dataset` représente une collection structurée. Chaque ligne est un exemple et chaque colonne décrit un champ.
 
+| Ligne | `id` | `question` | `answer` |
+| --- | --- | --- | --- |
+| 0 | a | Qu’est-ce qu’un batch ? | Un groupe d’exemples. |
+| 1 | b | Que calcule backward ? | Les gradients. |
 
-**Exemple simple.** Une table de messages et catégories.
+`dataset[0]` retourne une ligne. `dataset["answer"]` donne accès à une colonne. Les **features** décrivent les types des colonnes, par exemple texte ou liste de messages.
 
-### Feature
+Charger une table ne lance aucun entraînement. Ajouter une colonne de longueurs ne tokenise pas automatiquement les réponses et ne modifie aucun poids.
 
-**Définition concrète.** Description du type d’une colonne.
+## 3. Les opérations à distinguer
 
+| Opération | Question traitée | Effet typique sur le nombre de lignes |
+| --- | --- | --- |
+| `map` | Que faut-il calculer ou transformer ? | Inchangé dans notre exemple |
+| `filter` | Quels exemples conserver ? | Identique ou réduit |
+| `select` | Quels indices précis examiner ? | Nombre d’indices sélectionnés |
+| `shuffle` | Dans quel ordre parcourir ? | Inchangé |
+| `save_to_disk` | Comment conserver cette version ? | Sauvegarde, pas sélection |
 
-**Exemple simple.** `messages` peut être une liste de structures.
+Avec `batched=True`, `map` peut aussi produire un nombre de lignes différent ; ce n’est donc pas une règle universelle de conservation de la taille.
 
-### map
+Une fonction de transformation lisible retourne ici les champs à ajouter, sans modifier l’exemple reçu. Cela rend son intention plus facile à vérifier.
 
-**Définition concrète.** Transformation appliquée aux exemples ou batches.
+### Un compte à refaire à la main
 
+Supposons 8 lignes, dont 2 réponses vides. Si ces deux lignes sont les seuls retraits, il doit rester 6 lignes. Une transformation « trim des espaces » peut modifier le contenu sans changer ce nombre.
 
-**Exemple simple.** Ajouter `length_chars`.
+Les catégories peuvent pourtant changer de proportion : si les deux retraits appartiennent au diagnostic, cette catégorie devient moins représentée. Recompter seulement le total est insuffisant.
 
-### filter
+## 4. Laboratoire autonome — Du JSONL à une version sauvegardée
 
-**Définition concrète.** Conservation des exemples satisfaisant un prédicat.
+Le script fabrique quatre lignes pédagogiques et place son cache dans le même dossier temporaire. Il utilise un dossier temporaire qui sera supprimé à la fin : aucun fichier de ton dataset personnel n’est modifié.
 
-
-**Exemple simple.** Retirer les réponses vides.
-
-### shuffle
-
-**Définition concrète.** Permutation pseudo-aléatoire contrôlable par seed.
-
-
-**Exemple simple.** `seed=42` rend le résultat reproductible.
-
-### Fingerprint
-
-**Définition concrète.** Identifiant interne lié au contenu/transformation utilisé par la bibliothèque pour le cache.
-
-
-**Exemple simple.** Une transformation change généralement l’empreinte.
-
-## Intuition simple
-
-Traite ton pipeline de données comme un programme de compilation : données brutes → étapes explicites → dataset final. À chaque étape, tu dois pouvoir dire combien d’exemples entrent, combien sortent et pourquoi.
-
-## Ce qui se passe réellement sous le capot
-
-1. Charger le fichier avec un builder approprié.
-2. Inspecter colonnes, types et quelques exemples.
-3. Ajouter des métriques simples avec `map`.
-4. Filtrer les entrées invalides avec des conditions explicites.
-5. Normaliser les champs de manière déterministe.
-6. Sauvegarder ou versionner le résultat transformé.
-7. Recalculer les statistiques après chaque étape majeure.
-
-## Exemple minimal à comprendre mentalement
-
-Avant nettoyage :
-
-```text
-1000 exemples
-- 12 réponses vides
-- 8 rôles invalides
-- 40 doublons exacts
-```
-
-Après pipeline :
-
-```text
-940 exemples valides
-```
-
-Le nombre final n’est pas “magique” : le pipeline doit expliquer les 60 retraits.
-
-## Code minimal observable
+Avant de l’exécuter, prédis les IDs conservés et le nombre de lignes après chaque étape.
 
 ```python
-from datasets import load_dataset
+import json
+from collections import Counter
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from datasets import load_dataset, load_from_disk
 
-ds = load_dataset("json", data_files="data/train.jsonl", split="train")
-print(ds)
-print(ds.features)
-print(ds[0])
+rows = [
+    {"id": "a", "category": "definition", "answer": " Un batch regroupe des exemples. "},
+    {"id": "b", "category": "comparaison", "answer": "backward calcule ; step met à jour."},
+    {"id": "c", "category": "diagnostic", "answer": "   "},
+    {"id": "d", "category": "diagnostic", "answer": "Vérifie les formes des tenseurs."},
+]
 
-def add_len(row):
-    row["chars"] = sum(len(m["content"]) for m in row["messages"])
-    return row
 
-ds2 = ds.map(add_len)
-ds3 = ds2.filter(lambda r: r["chars"] > 0)
-print(len(ds), len(ds3))
+def add_metrics(row):
+    cleaned = row["answer"].strip()
+    return {"answer": cleaned, "answer_chars": len(cleaned)}
+
+
+def has_answer(row):
+    return row["answer_chars"] > 0
+
+
+with TemporaryDirectory(prefix="module10-") as directory:
+    root = Path(directory)
+    path = root / "brut.jsonl"
+    with path.open("w", encoding="utf-8") as file:
+        for row in rows:
+            file.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    raw = load_dataset("json", data_files=str(path), split="train", cache_dir=str(root / "cache"))
+    measured = raw.map(add_metrics)
+    clean = measured.filter(has_answer)
+
+    print("Schéma :", clean.features)
+    print("Comptes :", len(raw), len(measured), len(clean))
+    print("IDs conservés :", list(clean["id"]))
+    print("Catégories :", dict(Counter(clean["category"])))
+    indices = sorted({0, len(clean) // 2, len(clean) - 1})
+    print("Inspection à différents indices :", clean.select(indices).to_list())
+
+    first = clean.shuffle(seed=42)
+    second = clean.shuffle(seed=42)
+    print("Même ordre avec la même seed :", list(first["id"]) == list(second["id"]))
+
+    destination = root / "version_nettoyee"
+    clean.save_to_disk(str(destination))
+    restored = load_from_disk(str(destination))
+    print("Contenu restauré identique :", restored.to_list() == clean.to_list())
+    print("Première réponse brute préservée :", repr(raw[0]["answer"]))
 ```
 
-## Laboratoire guidé
+Tu dois retrouver **4 → 4 → 3 lignes**, les IDs **a, b, d**, une ligne par catégorie, et deux comparaisons finales vraies. L’objet `raw` conserve les espaces initiaux ; `map` retourne un autre dataset.
 
-1. Charge ton dataset.  
-2. Affiche 5 exemples choisis à différents indices, pas seulement les premiers.  
-3. Ajoute `chars`, nombre de tours et catégorie.  
-4. Filtre les réponses vides ou invalides.  
-5. `shuffle(seed=123)` deux fois et confirme le même ordre.  
-6. Écris un petit rapport avant/après transformation.
+`split="train"` est ici le nom technique du split chargé par le builder. Il ne transforme pas ces données en un train indépendant d’une validation : cette séparation reste à construire au module 11.
 
-## Ce que tu dois observer
+### Ce que le code vérifie réellement
 
-- Les erreurs de schéma apparaissent plus tôt si tu valides dès le chargement.
-- Une transformation simple peut changer fortement la distribution.
-- Une seed contrôle le pseudo-aléatoire mais ne remplace pas la version des données.
+La règle `answer_chars > 0` vérifie la présence d’une réponse après suppression des espaces de bord. Elle ne juge ni sa vérité ni sa clarté. Les contrôles de contenu du module 9 restent nécessaires.
 
-## À ne pas confondre
+Les longueurs sont des caractères Python, pas des tokens. Une réponse courte en caractères peut encore être fortement fragmentée par un tokenizer.
 
-- `map` ≠ entraînement.
-- Shuffle ≠ split.
-- Filtrer un exemple ≠ masquer certains de ses tokens dans la loss.
+## 5. Reprendre ton corpus du module 9
 
-## Erreurs fréquentes
+Remplace la création des lignes pédagogiques par un chargement de `data/module09/dataset.jsonl`. Le chemin dépend du dossier depuis lequel tu lances Python.
 
-- Transformer des données sans mesurer les comptes avant/après.
-- Cacher des règles métier complexes dans une lambda impossible à auditer.
-- Inspecter uniquement `ds[0]`.
+Ton schéma contient `messages`. Adapte donc la mesure : compte par exemple la longueur de `row["messages"][1]["content"]` pour notre format à un échange. Ne réutilise pas une fonction conçue pour une colonne `answer` absente de ce fichier.
 
-## Exercices
+Conserve les IDs, catégories et sources. Pour une vraie sortie persistante, remplace le dossier temporaire par un dossier de version explicite, par exemple `data/module10/v1`, puis documente les transformations.
 
-1. Ajoute un contrôle de rôles autorisés.
-2. Produit un histogramme textuel des longueurs par tranches.
-3. Explique ce que tu dois versionner pour reproduire le dataset final.
+## 6. Matérialisé, paresseux et cache
 
-## Validation — avant de continuer
+Un `Dataset` classique s’appuie généralement sur des données au format Arrow. Ses transformations peuvent être matérialisées et mises en cache ; toutes les données n’ont pas nécessairement à être copiées dans la RAM en une fois.
 
-Tu dois pouvoir, sans simplement réciter le code :
+Un `IterableDataset`, notamment en streaming, est parcouru progressivement. Il ne propose pas les mêmes accès par indices ni les mêmes garanties de mélange global.
 
-- Charger et inspecter un dataset avec `datasets`.
-- Expliquer `map`, `filter`, `shuffle` et seed.
-- Montrer les statistiques avant/après nettoyage.
-- Reproduire exactement le dataset transformé depuis les données brutes.
+Le **fingerprint** est une empreinte interne utilisée notamment pour identifier des transformations et gérer le cache. C’est utile pour éviter du travail répété ; ce n’est pas une fiche de provenance complète ni une preuve de qualité.
+
+Pour reproduire le résultat, conserve données sources, script, versions, décisions humaines et paramètres aléatoires. Une seed ne remplace pas un corpus versionné.
+
+## 7. Expériences guidées
+
+1. Ajoute une deuxième réponse vide dans la catégorie diagnostic. Prédis les nouvelles proportions après filtre ; compare les comptes par catégorie avant/après.
+2. Remplace `has_answer` par un seuil de 40 caractères. Examine toutes les lignes supprimées : le seuil élimine-t-il des réponses pourtant utiles ?
+3. Recommence le mélange avec une autre seed. Le contenu doit rester le même ; l’ordre peut changer. Sur un très petit dataset, deux seeds peuvent aussi donner le même ordre.
+4. Ajoute une colonne `turns` à ton corpus conversationnel avec `map`, puis inspecte plusieurs indices. Écris la convention : nombre de messages ou nombre d’échanges ?
+
+Conserve un rapport qui indique les règles, les comptes et au moins un exemple affecté par chaque règle.
+
+## 8. Erreurs à savoir reconnaître
+
+| Symptôme | Vérification |
+| --- | --- |
+| `KeyError: answer` | Inspecter `column_names` et une ligne ; utiliser le schéma réel |
+| Une catégorie disparaît | Recompter avant/après chaque filtre |
+| Un texte est modifié sans raison apparente | Relire la normalisation appliquée dans `map` |
+| Une sortie semble ancienne | Vérifier sources, destination et cache au lieu de changer plusieurs paramètres |
+| Les premiers exemples semblent tous semblables | Inspecter plusieurs indices et catégories |
+
+## 9. Exercices avec corrigés
+
+### Exercice 1 — Transformer ou sélectionner ?
+
+Tu veux ajouter le nombre de caractères puis conserver les réponses non vides. Quelles opérations utilises-tu ?
+
+<details>
+<summary>Corrigé</summary>
+
+`map` ajoute la longueur ; `filter` conserve les exemples selon une condition. Le second peut réduire le nombre de lignes. Aucun de ces appels n’entraîne un modèle.
+
+</details>
+
+### Exercice 2 — Lire un retrait
+
+Un dataset passe de 100 à 85 lignes. Peut-on conclure que 15 doublons ont été supprimés ?
+
+<details>
+<summary>Corrigé</summary>
+
+Non. Il faut connaître la règle et le rapport des retraits. Le même compte pourrait provenir de réponses vides, de longueurs excessives ou d’un filtre erroné.
+
+</details>
+
+### Exercice 3 — Reproduire
+
+Tu conserves seulement `seed=42` et un fichier final. Qu’est-ce qui manque pour expliquer sa fabrication ?
+
+<details>
+<summary>Corrigé</summary>
+
+Les sources versionnées, le script, les décisions de relecture, les versions des bibliothèques et les autres paramètres. La seed explique une partie du hasard, pas les modifications du contenu.
+
+</details>
+
+### Exercice 4 — Un champ vide caché
+
+Une ligne contient une question longue mais une réponse vide. Pourquoi filtrer sur la somme des longueurs de tous les messages la conserverait-il ?
+
+<details>
+<summary>Corrigé</summary>
+
+La longueur de la question suffit à rendre la somme positive. Il faut contrôler le contenu de la réponse attendue, pas seulement le texte total de la conversation.
+
+</details>
+
+## 10. Validation — avant de continuer
+
+- [ ] Je charge un JSONL et inspecte son schéma réel.
+- [ ] Je distingue `map`, `filter`, `select` et `shuffle`.
+- [ ] Je retrouve `4 → 4 → 3` et les IDs attendus.
+- [ ] Je rapporte les catégories avant/après une transformation.
+- [ ] Je sais sauvegarder, recharger et comparer les contenus.
+- [ ] Je peux expliquer les limites d’un filtre de longueur et du cache.
 
 ## Fiche mémo
 
-Un pipeline de données sérieux rend chaque modification explicite, mesurable et reproductible.
+```text
+Charger → inspecter → mesurer → transformer → recompter → sauvegarder.
+Chaque retrait doit correspondre à une règle explicite.
+Dataset chargé n’est pas synonyme de split d’évaluation indépendant.
+```
 
-## Lien avec le module suivant
+Le [module 11](11_train_validation_test_et_contamination.md) construit cette séparation.
 
-Le module 11 sépare maintenant ce dataset en train, validation et test sans contaminer l’évaluation.
+## Référence
 
----
-
-> **Règle de progression :** si un point de la validation n’est pas clair, refais le micro-exemple et le laboratoire. Le but est de construire un modèle mental solide, pas d’accumuler des commandes.
+[Hugging Face Datasets : transformations](https://huggingface.co/docs/datasets/en/process) — opérations de sélection, transformation et sauvegarde.

@@ -1,169 +1,177 @@
-# Module 37 — Pré-entraînement from scratch
+# Module 37 — Planifier un pré-entraînement depuis des poids aléatoires
 
-## Pourquoi ce module arrive ici
+## 1. Ce que tu vas apprendre
 
-Jusqu’ici, tous les entraînements partaient de poids déjà appris. Le pré-entraînement from scratch change la situation : tokenizer, architecture, initialisation, corpus et optimisation doivent ensemble créer les représentations de base.
+Tu as déjà utilisé des miniatures aléatoires pour comprendre les trainers. Ici commence un parcours où tokenizer, corpus, architecture et optimisation sont conçus ensemble pour apprendre un modèle de langage de base.
 
-## Objectifs
+Tu vas fixer des budgets, instancier une petite architecture et distinguer une expérience pédagogique d’un modèle utilisable comme assistant.
 
-Comprendre ce que “from scratch” signifie, les quatre budgets fondamentaux (paramètres, tokens, contexte, compute), pourquoi commencer petit, et distinguer une expérience pédagogique d’un pré-entraînement de production.
+**Prérequis :** modules 1 à 8 et 25. La série 38 à 42 détaillera les composants ; le dimensionnement architectural sera approfondi au module 40.
 
-**Prérequis :** Les modules précédents.  
-**Temps indicatif :** 45 à 90 minutes, laboratoire compris.  
-**Niveau :** Pré-entraînement
+**Temps indicatif :** 90 à 150 minutes pour la planification et le pilote, hors entraînement cible.
 
-## Définitions concrètes
+**Matériel :** PyTorch et Transformers sur CPU pour les configurations minuscules.
 
-### From scratch
+## 2. Que signifie from scratch ?
 
-**Définition concrète.** Modèle initialisé sans poids pré-entraînés de la même tâche.
+Le modèle démarre avec une initialisation numérique et sans les poids linguistiques d’une base préentraînée. `Model(config)` crée cet état ; `from_pretrained(...)` recharge un état appris ou sauvegardé.
 
+Le tokenizer peut être nouveau ou choisi parmi des outils existants compatibles avec ce projet. Réutiliser un tokenizer ne donne pas les connaissances de son ancien modèle à de nouveaux embeddings.
 
-**Exemple simple.** Les matrices commencent avec une initialisation numérique, pas des connaissances linguistiques.
+Un **base model** appris sur du texte n’est pas automatiquement un assistant conversationnel. Les démonstrations SFT et autres étapes éventuelles restent des expériences séparées.
 
-### Base model
+## 3. Les budgets à annoncer ensemble
 
-**Définition concrète.** Modèle issu du pré-entraînement causal avant instruction tuning.
+| Budget | Question |
+| --- | --- |
+| Paramètres | Combien de poids et de paramètres optimisés ? |
+| Données | Combien de documents et de tokens distincts, de quelles sources ? |
+| Expositions | Combien de positions/cibles présentées, répétitions comprises ? |
+| Contexte | Combien de positions par séquence ? |
+| Calcul et temps | Quel débit mesuré, quel temps disponible ? |
+| Mémoire et stockage | Le step complet et les checkpoints tiennent-ils ? |
 
+Doubler la largeur peut augmenter plusieurs matrices approximativement au carré. Doubler la séquence accroît les activations et une attention dense peut avoir un coût quadratique en longueur. Les décisions ne sont pas indépendantes.
 
-**Exemple simple.** Il complète du texte mais n’est pas forcément un bon assistant.
+Une approximation dense souvent utilisée est `FLOPs ≈ 6×N×T` pour un training de Transformer, sous des conventions simplifiées. Attention, projections de vocabulaire, architecture, séquences et implémentations peuvent changer l’approximation. Ce n’est pas une promesse de durée ni une loi de dimensionnement suffisante.
 
-### Training token
+## 4. Refaire un budget de tokens
 
-**Définition concrète.** Position de token effectivement présentée au modèle pendant l’optimisation.
+Batch global de 16 séquences pleines de 512 positions : **8 192 positions d’entrée par update**.
 
-
-**Exemple simple.** Un corpus de 10M tokens vu 2 fois représente environ 20M token exposures.
-
-### Compute budget
-
-**Définition concrète.** Quantité de calcul disponible pour l’expérience.
-
-
-**Exemple simple.** GPU-heures, FLOPs, tokens/s.
-
-### Scaling law
-
-**Définition concrète.** Relation empirique entre taille modèle, données, compute et loss.
-
-
-**Exemple simple.** Utile pour planifier; ce n’est pas une règle unique à appliquer aveuglément.
-
-### Initialization
-
-**Définition concrète.** Distribution initiale des paramètres avant apprentissage.
-
-
-**Exemple simple.** Poids petits, souvent selon une règle adaptée à l’architecture.
-
-## Intuition simple
-
-Fine-tuner, c’est modifier une maison déjà construite. Pré-entraîner from scratch, c’est choisir les briques, les dimensions, les fondations et construire la maison entière. Une erreur dans le tokenizer ou le pipeline de données peut coûter tout le run.
-
-## Ce qui se passe réellement sous le capot
-
-1. Définir le but scientifique/pédagogique.
-2. Choisir ou entraîner un tokenizer.
-3. Préparer et versionner le corpus.
-4. Choisir une architecture et un nombre de paramètres compatible avec le compute.
-5. Initialiser aléatoirement les poids.
-6. Découper les tokens en séquences.
-7. Optimiser la next-token loss pendant un budget défini.
-8. Sauvegarder checkpoints et logs.
-9. Évaluer loss/perplexité et générations.
-10. Appliquer ensuite éventuellement SFT et post-training.
-
-## Exemple minimal à comprendre mentalement
-
-Expérience pédagogique réaliste :
+Pour viser au moins 20M positions avec des updates pleines :
 
 ```text
-Tokenizer : 16k
-Modèle    : ~30–100M paramètres
-Contexte  : 512 ou 1024
-Corpus    : quelques dizaines/centaines de millions de tokens si disponible
-Objectif  : observer apprentissage et diagnostiquer le pipeline
+ceil(20 000 000 / 8192) = 2442 updates
+2442 × 8192 = 20 004 864 positions
 ```
 
-Ce modèle ne vise pas à rivaliser avec un grand LLM moderne. Il vise à te permettre d’observer chaque mécanisme.
+Les cibles causales ne sont pas nécessairement toutes ces positions : dans des lignes séparées sans cible suivante, chaque ligne de L IDs fournit L−1 cibles. Padding et masques retirent encore certaines cibles.
 
-## Formules et notation utiles
+Annonce si ton budget compte entrées, tokens non PAD ou cibles de loss. L’epoch seule décrit mal les comparaisons si le corpus est répété ou mélangé par sampling.
 
-Une approximation souvent utilisée pour le coût du training dense d’un Transformer est de l’ordre de :
+## 5. Laboratoire autonome — Créer trois tailles et compter
 
-\[
-FLOPs \propto N_{params}\times N_{tokens}
-\]
-
-avec un facteur constant dépendant des conventions/architecture. Retenir surtout : doubler paramètres **ou** tokens augmente fortement le compute; on ne choisit pas ces nombres indépendamment du matériel.
-
-## Code minimal observable
+Ces modèles sont volontairement très petits : leur intérêt est la rapidité de vérification, pas leur performance linguistique.
 
 ```python
-# Le point pédagogique : from scratch = configuration -> modèle, pas from_pretrained.
+import math
+import torch
 from transformers import GPT2Config, GPT2LMHeadModel
 
-config = GPT2Config(
-    vocab_size=16000,
-    n_positions=512,
-    n_embd=384,
-    n_layer=6,
-    n_head=6,
-)
-model = GPT2LMHeadModel(config)
-print(sum(p.numel() for p in model.parameters()))
+torch.manual_seed(42)
+counts = []
+for hidden, layers in [(24, 1), (32, 2), (48, 2)]:
+    config = GPT2Config(vocab_size=256, n_positions=64, n_embd=hidden,
+                        n_layer=layers, n_head=4, bos_token_id=None,
+                        eos_token_id=1, pad_token_id=0, use_cache=False)
+    model = GPT2LMHeadModel(config)
+    parameters = sum(p.numel() for p in model.parameters())
+    counts.append(parameters)
+    ids = torch.randint(2, 256, (1, 16))
+    with torch.no_grad():
+        output = model(input_ids=ids)
+    print('H=', hidden, 'blocs=', layers, 'parametres=', parameters,
+          'poids FP32 octets=', sum(p.numel() * p.element_size() for p in model.parameters()),
+          'logits=', tuple(output.logits.shape))
+    del model
+
+positions_per_update = 16 * 512
+updates = math.ceil(20_000_000 / positions_per_update)
+print('Updates :', updates, 'positions :', updates * positions_per_update)
 ```
 
-## Laboratoire guidé
+Les trois sorties doivent avoir la forme **[1,16,256]** et les nombres de paramètres augmenter avec ces configurations. Le budget final doit être **2442 updates** et **20 004 864 positions**.
 
-1. Crée trois configurations de tailles différentes sans les entraîner.  
-2. Compte les paramètres.  
-3. Estime la mémoire des poids BF16.  
-4. Écris un budget de tokens et calcule approximativement combien de steps il représente pour ton batch de tokens.  
-5. Choisis la plus petite configuration qui permettra d’itérer rapidement sur ton matériel.
+Un forward réussi ne valide ni les gradients, ni la reprise, ni le tokenizer, ni l’apprentissage. Il faut encore franchir les étapes suivantes.
 
-## Ce que tu dois observer
+## 6. La porte avant un long run
 
-- Le choix de vocabulaire affecte embeddings et LM head.
-- Le contexte affecte fortement les activations/attention.
-- Un modèle trop grand ralentit tellement les itérations qu’il devient mauvais pour apprendre le pipeline.
+Avant d’augmenter taille ou durée, exige :
 
-## À ne pas confondre
+1. Tokenizer figé, couverture et round-trip vérifiés.
+2. Corpus et splits versionnés, sans recouvrement connu indésirable.
+3. Batch correctement formé, loss et gradients finis.
+4. Mémorisation possible d’un seul batch, dans un objectif compatible.
+5. Validation réservée calculée avec la bonne pondération.
+6. Sauvegarde puis reprise réellement testée.
+7. Mémoire et débit du step complet mesurés avec marge.
 
-- From scratch ≠ continued pretraining.
-- Base model ≠ chat model.
-- Plus gros ≠ meilleure expérience pédagogique.
-- Nombre d’epochs sur texte ≠ seule manière de penser le budget; les tokens vus sont souvent plus utiles.
+Si un point échoue, le grand run reproduira plus cher un problème déjà observable. La série 38 à 52 construit ces vérifications.
 
-## Erreurs fréquentes
+## 7. Scaling laws : repères empiriques
 
-- Commencer par plusieurs milliards de paramètres.
-- Ne pas faire de smoke test sur un petit sous-ensemble.
-- Lancer un long run avant de vérifier tokenizer, loss, checkpoints et validation.
+Des relations empiriques relient paramètres, données, calcul et loss dans certains régimes. Elles aident à formuler un budget, pas à garantir un comportement de chat ni à choisir un modèle à partir d’une seule constante.
 
-## Exercices
+Les très petites expériences, données très répétées et architectures différentes peuvent s’écarter des régimes étudiés. Mesurer le débit et la courbe d’un pilote est plus concret qu’extrapoler aveuglément un tableau de grands modèles.
 
-1. Explique pourquoi vocab_size augmente le nombre de paramètres.
-2. Définis un budget de 20M tokens avec batch global de 16×512 tokens : combien de steps environ ?
-3. Liste cinq artefacts à figer avant un long run.
+## 8. Expériences guidées
 
-## Validation — avant de continuer
+- Fixe largeur et profondeur puis double seulement le vocabulaire ; sépare le coût d’embedding et le total mesuré.
+- Fixe les paramètres architecturaux et compare des forwards sur L=16,32,64. Mesure les temps sans promettre une relation idéale sur CPU.
+- Rédige un budget en tokens et secondes à partir d’un débit **mesuré**, avec la convention du compteur.
+- Définis ce que ton premier modèle doit démontrer : apprentissage du pipeline, et non qualité comparable à un grand assistant.
 
-Tu dois pouvoir, sans simplement réciter le code :
+## 9. Exercices avec corrigés
 
-- Expliquer from scratch vs CPT.
-- Construire un modèle aléatoire depuis une config.
-- Relier paramètres, tokens, contexte et compute.
-- Choisir une taille pédagogique justifiée.
+### Exercice 1 — Deux départs
+
+Quelle différence entre CPT et from scratch ?
+
+<details>
+<summary>Corrigé</summary>
+
+CPT poursuit un objectif depuis des poids déjà appris ; from scratch construit les représentations à partir d’une initialisation. Les deux demandent des données et un protocole explicites.
+
+</details>
+
+### Exercice 2 — Budget exact
+
+10 000 updates à 32×512 positions donnent combien de positions ?
+
+<details>
+<summary>Corrigé</summary>
+
+**163 840 000 positions**. Il faut encore préciser padding, cibles et répétitions pour parler des tokens utiles ou distincts.
+
+</details>
+
+### Exercice 3 — Tokenizer réutilisé
+
+Un tokenizer de qualité suffit-il à transmettre les connaissances de son modèle d’origine ?
+
+<details>
+<summary>Corrigé</summary>
+
+Non. Il fournit une segmentation et des IDs ; de nouveaux embeddings aléatoires n’héritent pas des poids appris de l’ancien réseau.
+
+</details>
+
+### Exercice 4 — Choisir petit
+
+Pourquoi un modèle de quelques dizaines de milliers de paramètres peut-il être utile ici ?
+
+<details>
+<summary>Corrigé</summary>
+
+Il permet de vérifier rapidement les formes, pertes, gradients et sauvegardes. Sa limite linguistique ne l’empêche pas de révéler des erreurs de pipeline.
+
+</details>
+
+## 10. Validation — avant de continuer
+
+- [ ] Je distingue initialisation, tokenizer et connaissances apprises.
+- [ ] Je crée un modèle depuis une config et compte ses paramètres.
+- [ ] Je retrouve le budget 2442 updates avec sa convention.
+- [ ] Je sépare données distinctes, expositions et cibles.
+- [ ] Je définis des critères avant de passer à l’échelle.
 
 ## Fiche mémo
 
-Le pré-entraînement from scratch est un **système complet** : données + tokenizer + architecture + optimisation + infrastructure + évaluation.
+```text
+From scratch = système complet, pas seulement un constructeur de modèle.
+Commencer assez petit pour tester tout le cycle.
+Budgeter paramètres, données, expositions, contexte, mémoire et temps ensemble.
+```
 
-## Lien avec le module suivant
-
-Le module 38 entraîne le premier composant irréversible de cette chaîne : le tokenizer BPE.
-
----
-
-> **Règle de progression :** si un point de la validation n’est pas clair, refais le micro-exemple et le laboratoire. Le but est de construire un modèle mental solide, pas d’accumuler des commandes.
+Le [module 38](38_entrainer_un_tokenizer_bpe.md) construit le tokenizer de cette chaîne.

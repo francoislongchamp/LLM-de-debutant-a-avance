@@ -1,147 +1,202 @@
-# Module 49 — FSDP et sharding
+# Module 49 — Répartir les états avec FSDP
 
-## Pourquoi ce module arrive ici
+## 1. Ce que tu vas apprendre
 
-Quand une réplique complète du modèle et de ses états ne tient plus sur chaque GPU, il faut répartir ces états. FSDP sharde les paramètres, gradients et/ou optimizer states selon la stratégie utilisée.
+DDP réplique les états du modèle. **FSDP**, *Fully Sharded Data Parallel*, répartit certains de ces états entre ranks et matérialise temporairement ce qui est nécessaire au calcul.
 
-## Objectifs
+Tu vas suivre shards, all-gather et reduce-scatter, puis lire un pilote FSDP2 distinct de la simulation CPU.
 
-Comprendre sharding, all-gather, reduce-scatter, full shard, state dict sharded/full et différence conceptuelle avec DDP/ZeRO. Configurer FSDP via Accelerate au niveau de base.
+**Prérequis :** modules 5, 23, 24 et 48.
 
-**Prérequis :** Les modules précédents.  
-**Temps indicatif :** 45 à 90 minutes, laboratoire compris.  
-**Niveau :** Training distribué
+**Temps indicatif :** deux séances de 60 à 90 minutes.
 
-## Définitions concrètes
+**Matériel :** PyTorch sur CPU pour le laboratoire A. Le B cible deux processus CUDA compatibles avec FSDP2 ; sans ce matériel, son exécution reste à valider.
 
-### Sharding
+## 2. Qu’est-ce qui est réparti ?
 
-**Définition concrète.** Division d’un tenseur/état entre plusieurs ranks.
+Dans une stratégie complètement shardée, paramètres, gradients et états d’optimizer peuvent être distribués. Le modèle logique reste le même ; chaque rank n’en conserve pas toujours une réplique complète au repos.
 
+| Opération | Rôle simplifié |
+| --- | --- |
+| Sharding | Répartir les morceaux d’un état |
+| All-gather | Réunir les morceaux nécessaires pour calculer un module |
+| Reduce-scatter | Réduire des contributions puis distribuer les morceaux du résultat |
+| Reshard | Revenir à une représentation répartie selon le planning |
 
-**Exemple simple.** Chaque GPU conserve une fraction d’une grande matrice ou de l’état associé selon la stratégie.
+Le détail de conservation après forward/backward dépend de la stratégie et de l’API. L’all-gather peut créer un pic bien supérieur au seul stockage des shards.
 
-### All-gather
+## 3. Un budget au repos n’est pas un pic
 
-**Définition concrète.** Collective réunissant temporairement des shards nécessaires sur les ranks.
+8 GiB de poids répartis idéalement sur quatre ranks donnent 2 GiB de cette composante par rank. Il faut encore prévoir paramètres temporairement réunis, gradients, optimizer, activations, buffers et communications.
 
+FSDP ne garantit donc ni une division exacte de toute la mémoire par quatre ni la possibilité de traiter un bloc trop grand pour ses matérialisations transitoires.
 
-**Exemple simple.** Reconstruire des paramètres pour un forward.
+Le choix des frontières de wrapping influence mémoire et communications : un seul énorme groupe et une multitude de minuscules groupes n’ont pas les mêmes compromis.
 
-### Reduce-scatter
+## 4. Laboratoire A — Simuler les morceaux et leur réduction
 
-**Définition concrète.** Réduit des valeurs entre ranks puis distribue les morceaux du résultat.
+Ce bloc est autonome. Il n’effectue aucune communication distribuée ; il montre seulement les valeurs que les collectives doivent produire.
 
+```python
+import torch
 
-**Exemple simple.** Utile pour gradients sharded.
+full = torch.arange(8, dtype=torch.float64)
+shards = list(full.chunk(4))
+reconstructed = torch.cat(shards)
+print('Shards au repos :', [shard.tolist() for shard in shards])
+print('All-gather simule correct :', torch.equal(full, reconstructed))
 
-### Full shard
-
-**Définition concrète.** Stratégie shardant paramètres, gradients et optimizer states.
-
-
-**Exemple simple.** Comparable conceptuellement à ZeRO-3 sur ces catégories.
-
-### State dict sharded
-
-**Définition concrète.** Checkpoint où chaque rank sauvegarde des shards plutôt qu’un gros tenseur complet.
-
-
-**Exemple simple.** Doit être consolidé/chargé avec le bon mécanisme.
-
-### Auto wrap
-
-**Définition concrète.** Règle déterminant quels modules/blocs sont encapsulés/shardés.
-
-
-**Exemple simple.** Souvent blocs Transformer.
-
-## Intuition simple
-
-DDP donne un livre complet à chaque personne. FSDP découpe le livre entre elles et rassemble temporairement les pages nécessaires lorsqu’un chapitre doit être lu/calculé, puis redistribue les résultats.
-
-## Ce qui se passe réellement sous le capot
-
-1. Au repos, chaque rank possède seulement des shards selon la stratégie.
-2. Avant le calcul d’un bloc, les paramètres nécessaires sont all-gathered.
-3. Le bloc effectue forward/backward.
-4. Les gradients sont réduits et reshared via collectives adaptées.
-5. Les optimizer states restent eux aussi distribués en full shard.
-6. Le prochain bloc est traité.
-7. Les checkpoints peuvent rester sharded ou être consolidés selon objectif.
-
-## Exemple minimal à comprendre mentalement
-
-Modèle avec 8 GB de paramètres bruts sur 4 GPU : idéalement, le stockage sharded des paramètres peut tendre vers ~2 GB/GPU pour cette composante, **mais** le pic réel inclut all-gathers, activations, buffers, fragmentation et autres états. On ne divise donc pas simplement toute la VRAM par 4.
-
-## Formules et notation utiles
-
-Dans un idéal simplifié, une composante entièrement shardée de taille `M` sur `N` ranks utilise environ `M/N` au repos par rank. Le peak est supérieur à cette valeur en raison des paramètres temporairement matérialisés et des activations.
-
-## Code minimal observable
-
-```yaml
-# Extrait conceptuel d’une config Accelerate FSDP.
-# Les options exactes dépendent de la version installée.
-distributed_type: FSDP
-mixed_precision: bf16
-num_processes: 4
-fsdp_config:
-  fsdp_sharding_strategy: FULL_SHARD
-  fsdp_auto_wrap_policy: TRANSFORMER_BASED_WRAP
-  fsdp_state_dict_type: SHARDED_STATE_DICT
+local_gradients = [torch.arange(8, dtype=torch.float64) + rank for rank in range(4)]
+mean_gradient = torch.stack(local_gradients).mean(dim=0)
+reduced_shards = list(mean_gradient.chunk(4))
+print('Gradient moyen :', mean_gradient.tolist())
+print('Reduce-scatter moyenne simule :', [shard.tolist() for shard in reduced_shards])
+print('Poids ideaux au repos, GiB/rank :', 8 / 4)
 ```
 
-## Laboratoire guidé
+Les shards initiaux sont `[0,1]`, `[2,3]`, `[4,5]`, `[6,7]`. Le gradient moyen commence à 1.5 et finit à 8.5. La concaténation de ses shards doit restituer cette moyenne.
 
-1. Lis la config FSDP générée par `accelerate config`.  
-2. Identifie ce qui est sharded.  
-3. Sur plusieurs GPU, compare mémoire/rank DDP vs FSDP pour un petit modèle suffisamment gros pour voir la différence.  
-4. Sauvegarde un checkpoint sharded et documente la procédure de restauration.  
-5. Étudie l’outil de merge/consolidation correspondant à ta version si tu as besoin d’un checkpoint unique.
+La simulation affiche une **moyenne**. Les collectives de bas niveau peuvent sommer ; la division et sa place dépendent du mécanisme utilisé. Annonce la convention au lieu de supposer que « reduce » signifie toujours moyenne.
 
-## Ce que tu dois observer
+## 5. Laboratoire B — Structure d’un pilote FSDP2 CUDA
 
-- FSDP réduit la duplication de certains états mais augmente les communications.
-- Le wrapping influence mémoire et performance.
-- Les checkpoints distribués exigent une procédure explicite.
-- Les versions récentes de PyTorch/Accelerate font évoluer les API FSDP; figer la version du cours/projet est important.
+Enregistre le bloc dans `fsdp2_demo.py`, puis lance sur une machine adaptée :
 
-## À ne pas confondre
+```bash
+torchrun --standalone --nproc_per_node=2 fsdp2_demo.py
+```
 
-- FSDP ≠ DDP.
-- Shard au repos ≠ aucune matérialisation temporaire.
-- FSDP checkpoint ≠ forcément un fichier unique immédiatement chargeable comme un modèle standard.
+Ce code cible l’API composable FSDP2 présente dans l’environnement PyTorch 2.6 du cours. Le lancement simple ou sans CUDA affiche une limitation ; il ne constitue pas une validation de sharding.
 
-## Erreurs fréquentes
+```python
+import os
+import torch
+from torch import nn
+import torch.distributed as dist
 
-- Conclure que 4 GPU donnent exactement 4× la capacité mémoire.
-- Ignorer le réseau/NVLink/PCIe et le coût des collectives.
-- Ne pas tester la restauration des checkpoints avant un long run.
 
-## Exercices
+def main():
+    world = int(os.environ.get('WORLD_SIZE', '1'))
+    if world < 2 or not torch.cuda.is_available():
+        print('Pilote FSDP2 non execute : deux processus CUDA compatibles sont requis.')
+        return
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.fsdp import fully_shard
+    local_rank = int(os.environ['LOCAL_RANK'])
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group('nccl')
+    try:
+        torch.manual_seed(42)
+        mesh = init_device_mesh('cuda', (world,))
+        model = nn.Sequential(nn.Linear(64, 64), nn.GELU(), nn.Linear(64, 1)).to(local_rank)
+        fully_shard(model[0], mesh=mesh)
+        fully_shard(model[2], mesh=mesh)
+        fully_shard(model, mesh=mesh)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=0.001)
+        torch.manual_seed(100 + dist.get_rank())
+        x = torch.randn(8, 64, device=local_rank)
+        y = x.sum(dim=-1, keepdim=True)
+        optimizer.zero_grad(set_to_none=True)
+        loss = nn.functional.mse_loss(model(x), y)
+        loss.backward()
+        optimizer.step()
+        print('rank=', dist.get_rank(), 'loss locale=', loss.item(), flush=True)
+    finally:
+        dist.destroy_process_group()
 
-1. Explique all-gather avec 4 shards.
-2. Explique reduce-scatter.
-3. Compare conceptuellement DDP, FSDP full shard et ZeRO-3.
 
-## Validation — avant de continuer
+if __name__ == '__main__':
+    main()
+```
 
-Tu dois pouvoir, sans simplement réciter le code :
+L’optimizer est créé **après** la transformation des paramètres. Le wrapping se fait ici depuis les sous-modules vers le module parent. Le petit réseau sert à tester le mécanisme, pas à démontrer un gain mémoire mesurable d’un gros LLM.
 
-- Expliquer ce qui est sharded.
-- Expliquer all-gather/reduce-scatter.
-- Distinguer FSDP de DDP.
-- Créer et comprendre une config Accelerate FSDP.
+## 6. FSDP1, FSDP2 et ZeRO
+
+Les générations d’API ne se configurent pas indistinctement. Une ancienne classe `FullyShardedDataParallel`, une config Accelerate FSDP1 et la fonction composable `fully_shard` n’ont pas toutes les mêmes options et formats d’état.
+
+ZeRO-3 partage l’idée de répartir paramètres, gradients et optimizer ; les détails d’orchestration, d’offload et de checkpoint diffèrent selon les outils.
+
+Pour Accelerate, génère une configuration avec la version utilisée et vérifie la génération FSDP ciblée. Copier un YAML ancien contenant quelques noms plausibles ne suffit pas à définir une expérience compatible.
+
+## 7. Sauvegarder et restaurer des états répartis
+
+Un checkpoint shardé n’est pas « incomplet » parce qu’il n’est pas un fichier monolithique. Il requiert un protocole de sauvegarde/chargement correspondant aux états distribués, souvent avec participation collective.
+
+Pour une exportation standard, une consolidation ou une conversion peut être nécessaire. Vérifie le coût mémoire de cette étape : réunir tous les poids sur un rank peut réintroduire un pic important.
+
+Teste restauration et éventuelle conversion sur le petit pilote avant un gros entraînement. Le module 51 expose les états logiques à conserver ; le format distribué doit en plus être traité selon le framework.
+
+## 8. Expériences guidées
+
+1. Sur CPU, change le nombre de shards et vérifie les tailles, y compris pour une longueur non divisible.
+2. Sur matériel adapté, compare DDP et FSDP à modèle, batch, contexte et précision fixés. Mesure le pic de **chaque rank**.
+3. Compare deux frontières de wrapping et rapporte mémoire, débit et communication.
+4. Sauvegarde un petit état shardé puis recharge-le avec la procédure de la version utilisée ; ne te contente pas de l’existence des fichiers.
+
+## 9. Exercices avec corrigés
+
+### Exercice 1 — All-gather
+
+Quatre ranks gardent chacun deux valeurs d’un vecteur de huit. Que reconstruit l’all-gather simplifié ?
+
+<details>
+<summary>Corrigé</summary>
+
+Les huit valeurs dans l’ordre défini par le partitionnement, là où elles sont nécessaires au calcul. Cette matérialisation demande une mémoire temporaire.
+
+</details>
+
+### Exercice 2 — Différence avec DDP
+
+Quel stockage DDP conserve-t-il que le full sharding cherche à répartir ?
+
+<details>
+<summary>Corrigé</summary>
+
+DDP garde une réplique complète des paramètres et habituellement des états locaux associés. Le full sharding distribue ces composantes selon sa stratégie.
+
+</details>
+
+### Exercice 3 — Pic mémoire
+
+Pourquoi M/N n’est-il pas le budget complet par rank ?
+
+<details>
+<summary>Corrigé</summary>
+
+Cette division décrit une composante shardée au repos. Activations, all-gathers, temporaires, gradients et autres états contribuent au pic.
+
+</details>
+
+### Exercice 4 — Checkpoint
+
+Pourquoi tester une conversion vers un modèle monolithique avant un long run ?
+
+<details>
+<summary>Corrigé</summary>
+
+Le format et le pic mémoire de consolidation peuvent poser des problèmes différents du training. Un ensemble de shards créé sans erreur ne prouve pas une exportation restaurable dans l’usage visé.
+
+</details>
+
+## 10. Validation — avant de continuer
+
+- [ ] Je suis les valeurs du laboratoire simulé sans le confondre avec une collective réelle.
+- [ ] Je distingue réplication, all-gather, reduce-scatter et reshard.
+- [ ] Je sais quelle API/génération mon pilote cible.
+- [ ] Je distingue stockage au repos et pic par rank.
+- [ ] Je documente restauration et conversion du checkpoint.
 
 ## Fiche mémo
 
-FSDP échange **moins de duplication mémoire** contre **plus d’orchestration et de communication**.
+```text
+Moins de duplication permanente, davantage de matérialisations et communications.
+La version d’API et les frontières de wrapping font partie de la configuration.
+```
 
-## Lien avec le module suivant
+Le [module 50](50_budget_memoire_du_training.md) rassemble ces coûts dans un budget mesuré.
 
-Le module 50 rassemble toutes les composantes pour construire un vrai budget mémoire.
+## Référence
 
----
-
-> **Règle de progression :** si un point de la validation n’est pas clair, refais le micro-exemple et le laboratoire. Le but est de construire un modèle mental solide, pas d’accumuler des commandes.
+[PyTorch : tutoriel FSDP2](https://docs.pytorch.org/tutorials/intermediate/FSDP_tutorial.html).

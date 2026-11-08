@@ -1,154 +1,203 @@
-# Module 48 — Data Parallel et DDP
+# Module 48 — Répliquer le modèle et synchroniser les gradients avec DDP
 
-## Pourquoi ce module arrive ici
+## 1. Ce que tu vas apprendre
 
-Avant de shard un modèle, il faut comprendre le cas le plus simple du multi-GPU : chaque GPU possède une copie du modèle et traite une partie différente du batch. Les gradients sont ensuite synchronisés.
+**Distributed Data Parallel**, ou DDP, donne une copie du modèle à chaque processus et répartit les données. Les gradients synchronisés permettent aux copies d’effectuer des updates cohérentes.
 
-## Objectifs
+Tu vas calculer une moyenne de gradients, lire les ranks et lancer un pilote réel à deux processus CPU si l’environnement autorise les communications locales.
 
-Comprendre process/rank, replica, local batch, global batch, all-reduce de gradients et DistributedDataParallel. Lancer un exemple multi-GPU si disponible ou simuler les calculs de batch sur une seule machine.
+**Prérequis :** modules 8, 23 et 47.
 
-**Prérequis :** Les modules précédents.  
-**Temps indicatif :** 45 à 90 minutes, laboratoire compris.  
-**Niveau :** Training distribué
+**Temps indicatif :** deux séances de 60 à 90 minutes.
 
-## Définitions concrètes
+**Matériel :** PyTorch avec backend Gloo pour le pilote CPU ; aucun GPU requis. Le lancement multiprocessus demande un fichier Python et des communications locales autorisées.
 
-### Data parallel
+## 2. Définir les acteurs du calcul distribué
 
-**Définition concrète.** Même modèle répliqué, données différentes sur chaque device.
+| Terme | Sens |
+| --- | --- |
+| Processus/rank | Travailleur identifié globalement |
+| World size | Nombre total de processus du groupe |
+| Local rank | Indice local à une machine, utile notamment pour son GPU |
+| Réplique | Copie du modèle dans chaque travailleur |
+| All-reduce | Réduction d’une quantité entre ranks puis partage du résultat |
+| Sampler distribué | Affectation des indices de données aux ranks |
 
+DDP synchronise les gradients, mais ne découpe pas automatiquement ton dataset à ta place. Il faut un sampler ou une autre stratégie cohérente.
 
-**Exemple simple.** GPU0 traite batch A, GPU1 batch B.
+## 3. Refaire une moyenne à la main
 
-### Process / rank
+Avec deux gradients locaux moyens g0=2 et g1=6, DDP standard produit une moyenne de 4 sous les conventions habituelles. Si chaque rank a le même nombre de cibles, cette moyenne correspond à celle du batch global.
 
-**Définition concrète.** Processus distribué associé à un indice global.
+Avec 1 cible sur le premier et 9 sur le second, la bonne moyenne par cible serait `(1×2+9×6)/10=5.6`. Moyenne de gradients locaux et moyenne globale par token ne coïncident plus automatiquement.
 
+Conserve les effectifs réels, notamment pour des réponses de longueurs variables et les fins de dataset. Le pilote utilise des effectifs égaux pour isoler la synchronisation.
 
-**Exemple simple.** rank 0, rank 1…
+## 4. Mémoire et batch effectif
 
-### Local rank
+Chaque réplique doit tenir sur son appareil, avec ses états selon la configuration. DDP ne divise pas les poids d’un gros modèle par le nombre de GPU.
 
-**Définition concrète.** Indice du processus sur une machine donnée.
+Pour micro-batch b, D ranks et A accumulations régulières, le batch nominal vaut `b×D×A`. Ajouter des ranks sans ajuster b/A change donc l’expérience autant que son débit.
 
+Les communications, transferts et données empêchent de promettre une accélération linéaire. Mesure débit global et efficacité, pas seulement utilisation apparente d’un appareil.
 
-**Exemple simple.** Souvent utilisé pour choisir la GPU locale.
+## 5. Laboratoire — DDP CPU et référence en un processus
 
-### Replica
-
-**Définition concrète.** Copie complète du modèle sur un device.
-
-
-**Exemple simple.** DDP garde une réplique par processus/GPU.
-
-### All-reduce
-
-**Définition concrète.** Collective combinant une valeur de tous les ranks et redistribuant le résultat.
-
-
-**Exemple simple.** Synchroniser les gradients moyens/sommes.
-
-### Distributed sampler
-
-**Définition concrète.** Répartit les exemples entre les ranks pour éviter que tous lisent le même mini-batch.
-
-
-**Exemple simple.** Chaque rank reçoit une partition différente.
-
-## Intuition simple
-
-Quatre personnes possèdent chacune la même feuille de modèle. Chacune travaille sur des exemples différents, calcule ses corrections, puis tout le monde met en commun les corrections avant de modifier sa copie de la même manière.
-
-## Ce qui se passe réellement sous le capot
-
-1. Lancer un process par GPU.
-2. Chaque process charge une réplique du modèle.
-3. Le sampler fournit des données différentes à chaque rank.
-4. Chaque rank fait forward/backward local.
-5. DDP synchronise les gradients, généralement via all-reduce/buckets.
-6. Chaque optimizer local applique alors la même mise à jour synchronisée.
-7. Les répliques restent cohérentes après chaque step.
-
-## Exemple minimal à comprendre mentalement
-
-```text
-GPU0: 2 exemples
-GPU1: 2 exemples
-GPU2: 2 exemples
-GPU3: 2 exemples
-accumulation=4
-```
-
-Batch effectif approximatif = `2×4×4=32` exemples/update.
-
-## Formules et notation utiles
-
-Le modèle complet doit tenir sur **chaque GPU** en DDP classique. DDP augmente donc surtout le débit/batch global, mais ne résout pas le cas où les poids + états ne tiennent pas sur une seule GPU.
-
-## Code minimal observable
+Enregistre ce bloc dans `ddp_cpu.py`. `python ddp_cpu.py` affiche seulement le mode de lancement. Pour exécuter réellement deux ranks :
 
 ```bash
-# Avec Accelerate, après configuration multi-GPU :
-accelerate config
-accelerate launch train.py
-
-# Le script de training peut ensuite être préparé par Accelerate
-# ou utiliser torch.distributed/DDP directement.
+torchrun --standalone --nproc_per_node=2 ddp_cpu.py
 ```
 
-## Laboratoire guidé
+Le script compare les updates DDP à celles d’une régression sur le même batch global dans chaque processus. Il utilise précisément deux ranks et quatre exemples pour éviter padding de sampler et effectifs inégaux.
 
-**Si tu as plusieurs GPU :**  
-1. Lance un script simple avec 2 processes.  
-2. Affiche rank/local_rank/device.  
-3. Vérifie que chaque process reçoit des indices de données différents.  
-4. Compare le débit 1 GPU vs 2 GPU.  
-5. Vérifie que le modèle complet tient toujours sur chaque GPU.
+```python
+import os
+from copy import deepcopy
+import torch
+import torch.distributed as dist
+from torch import nn
+from torch.nn.parallel import DistributedDataParallel
+from torch.utils.data import DataLoader, TensorDataset, DistributedSampler
 
-**Si tu n’as qu’une GPU :** calcule sur papier les batchs locaux/globaux pour 2, 4 et 8 ranks et étudie les collectives avec un petit exemple CPU `torch.distributed` plus tard.
 
-## Ce que tu dois observer
+def main():
+    world = int(os.environ.get('WORLD_SIZE', '1'))
+    if world == 1:
+        print('Lancer : torchrun --standalone --nproc_per_node=2 ddp_cpu.py')
+        return
+    if world != 2:
+        raise ValueError('Ce pilote utilise exactement deux ranks')
+    dist.init_process_group(backend='gloo')
+    try:
+        rank = dist.get_rank()
+        torch.set_num_threads(1)
+        torch.manual_seed(42)
+        local_model = nn.Linear(1, 1).double()
+        reference = deepcopy(local_model)
+        model = DistributedDataParallel(local_model)
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+        reference_optimizer = torch.optim.SGD(reference.parameters(), lr=0.01)
+        x = torch.arange(1, 5, dtype=torch.float64).reshape(-1, 1)
+        y = 2 * x + 1
+        dataset = TensorDataset(x, y)
+        sampler = DistributedSampler(dataset, num_replicas=world, rank=rank,
+                                     shuffle=True, seed=42, drop_last=False)
+        loader = DataLoader(dataset, batch_size=2, sampler=sampler)
+        for epoch in range(2):
+            sampler.set_epoch(epoch)
+            print('rank=', rank, 'epoch=', epoch, 'indices=', list(sampler), flush=True)
+            for local_x, local_y in loader:
+                optimizer.zero_grad(set_to_none=True)
+                loss = nn.functional.mse_loss(model(local_x), local_y)
+                loss.backward()  # DDP synchronise les gradients ici.
+                optimizer.step()
 
-- Le speedup n’est jamais parfaitement linéaire à cause des communications et du pipeline de données.
-- DDP réplique le modèle; sa mémoire par GPU n’est pas divisée par le nombre de GPU.
-- Le global batch change si tu ajoutes des GPUs sans ajuster batch/accumulation.
+                reference_optimizer.zero_grad(set_to_none=True)
+                nn.functional.mse_loss(reference(x), y).backward()
+                reference_optimizer.step()
+                assert all(torch.allclose(left, right, atol=1e-12, rtol=1e-12)
+                           for left, right in zip(local_model.parameters(), reference.parameters()))
+        if rank == 0:
+            print('Deux updates DDP equivalentes a la reference globale.', flush=True)
+    finally:
+        dist.destroy_process_group()
 
-## À ne pas confondre
 
-- DDP ≠ model parallelism.
-- Rank ≠ GPU model/name.
-- All-reduce de gradients ≠ partager les activations de toutes les couches.
+if __name__ == '__main__':
+    main()
+```
 
-## Erreurs fréquentes
+Les indices doivent se répartir entre les ranks, et les deux updates doivent être équivalentes à la référence sous la tolérance annoncée. `set_epoch` renouvelle le mélange ; sans lui, un sampler à seed fixe peut répéter le même ordre chaque epoch.
 
-- Ajouter des GPUs sans ajuster le batch global et comparer comme si l’expérience était identique.
-- Laisser chaque rank lire tous les mêmes exemples.
-- Faire du logging/checkpoint concurrent depuis tous les ranks sans coordination.
+Un lancement en un processus qui affiche la commande n’est **pas** un test réussi de synchronisation. Distingue ce cas du vrai lancement à deux ranks.
 
-## Exercices
+## 6. Fin de corpus et métriques globales
 
-1. Calcule batch effectif pour 8 GPUs×2 exemples×4 accumulation.
-2. Explique pourquoi un 70B qui ne tient pas sur une GPU ne devient pas magiquement chargeable avec DDP pur.
-3. Dessine le flux gradient local→all-reduce→optimizer.
+Un sampler peut ajouter des indices pour rendre les partitions compatibles, ou supprimer une fin selon ses options. Ces duplications peuvent biaiser une évaluation si tu les comptes sans correction.
 
-## Validation — avant de continuer
+Pour une loss globale, réduis les sommes NLL et les nombres de cibles puis divise ; ne moyenne pas aveuglément des moyennes locales de tailles différentes.
 
-Tu dois pouvoir, sans simplement réciter le code :
+Pour des prédictions et benchmarks, rassemble les IDs et sorties puis détecte doublons et manquants. Un seul rank qui écrit les scalaires simplifie certains logs, mais les collectives nécessaires doivent être appelées par tous les ranks concernés.
 
-- Expliquer la réplication DDP.
-- Calculer batch global.
-- Expliquer all-reduce de gradients.
-- Dire quand DDP aide et quand il n’aide pas la mémoire du modèle.
+## 7. Passer au multi-GPU
+
+Un montage courant utilise un processus par GPU, `local_rank` pour choisir l’appareil et NCCL pour les communications GPU adaptées. Les entrées et la réplique doivent être sur le bon appareil.
+
+Le pilote CPU n’est pas un test des performances, kernels ou communications multi-GPU. L’architecture matérielle, le réseau et les versions deviennent des paramètres de l’expérience.
+
+Avec accumulation, `no_sync()` peut éviter certaines synchronisations intermédiaires si utilisé correctement. Le dernier backward de la fenêtre doit encore synchroniser les contributions nécessaires.
+
+## 8. Exercices et expériences
+
+- Calcule le batch effectif de 8 ranks × 2 exemples × 4 accumulations.
+- Oublie volontairement le sampler dans une copie et affiche les indices : montre la répétition des mêmes données.
+- Augmente le dataset à cinq exemples et inspecte le comportement de fin de sampler au lieu de supposer une partition parfaite.
+- Compare débit 1/2 ranks avec même budget global et même mesure, puis explique la différence avec un changement de batch.
+
+## 9. Exercices avec corrigés
+
+### Exercice 1 — Batch global
+
+Quel résultat pour 8×2×4 ?
+
+<details>
+<summary>Corrigé</summary>
+
+**64 exemples** par update nominale complète.
+
+</details>
+
+### Exercice 2 — Mémoire
+
+Un modèle ne tient pas comme réplique sur un GPU. Deux GPU en DDP pur résolvent-ils forcément cela ?
+
+<details>
+<summary>Corrigé</summary>
+
+Non. Chaque rank garde une réplique complète. Il faut une autre stratégie de mémoire, de taille ou de répartition des états.
+
+</details>
+
+### Exercice 3 — Pondération
+
+Pourquoi 1 et 9 cibles locales rendent-ils la moyenne de deux gradients moyens insuffisante ?
+
+<details>
+<summary>Corrigé</summary>
+
+Elle donne le même poids aux deux groupes. Une moyenne globale par cible doit pondérer par leurs effectifs réels.
+
+</details>
+
+### Exercice 4 — Ranks
+
+Rank global et local rank sont-ils toujours identiques ?
+
+<details>
+<summary>Corrigé</summary>
+
+Non. Sur plusieurs machines, les indices locaux recommencent sur chaque machine, tandis que le rank global identifie le processus dans le groupe total.
+
+</details>
+
+## 10. Validation — avant de continuer
+
+- [ ] Je distingue réplication et partition des données.
+- [ ] Je sais calculer batch global et moyenne pondérée.
+- [ ] Je distingue lancement simple et vraie exécution à deux processus.
+- [ ] Je vérifie indices, fins de sampler et cohérence des poids.
+- [ ] Je sais ce que le pilote CPU ne valide pas sur GPU.
 
 ## Fiche mémo
 
-DDP répartit **les données et le calcul**, pas les poids du modèle : chaque GPU garde une réplique complète.
+```text
+Données différentes, copies du modèle cohérentes grâce aux gradients synchronisés.
+DDP répartit le travail ; il ne sharde pas les poids d’une réplique.
+```
 
-## Lien avec le module suivant
+Le [module 49](49_fsdp_et_sharding.md) répartit justement les états du modèle.
 
-Le module 49 shard les paramètres/gradients/optimizer states avec FSDP pour dépasser cette limite.
+## Référence
 
----
-
-> **Règle de progression :** si un point de la validation n’est pas clair, refais le micro-exemple et le laboratoire. Le but est de construire un modèle mental solide, pas d’accumuler des commandes.
+[PyTorch : DDP](https://docs.pytorch.org/tutorials/intermediate/ddp_tutorial.html).

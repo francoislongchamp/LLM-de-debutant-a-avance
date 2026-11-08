@@ -1,164 +1,210 @@
-# Module 61 — Projet 6 — RL vérifiable
+# Module 61 — Projet 6 : une boucle online avec correcteur vérifié
 
-## Pourquoi ce module arrive ici
+## 1. Ce que tu vas construire
 
-C’est le premier projet où la policy génère des réponses pendant l’entraînement et reçoit un reward calculé. La priorité absolue est de valider la reward avant de dépenser du compute.
+Un projet RL vérifiable relie générateur de problèmes, oracle, parser, policy, collecte online et évaluation réservée. Le score optimisé doit correspondre à la réussite voulue.
 
-## Objectifs
+Tu vas d’abord exécuter une miniature complète qui choisit entre deux procédures fournies, puis définir l’expérience où un LLM produit réellement les réponses.
 
-Construire une tâche automatiquement vérifiable, écrire une reward testée, mesurer la distribution initiale, lancer un petit GRPO et démontrer que reward et métrique indépendante progressent ensemble.
+**Prérequis :** modules 30 à 36, 51 à 55.
 
-**Prérequis :** Les modules précédents.  
-**Temps indicatif :** 6 à 12 heures pour un petit modèle et une tâche simple.  
-**Niveau :** Projet intégrateur
+**Temps indicatif :** pilote court ; plusieurs heures ou davantage pour un vrai modèle avec génération.
 
-## Définitions concrètes
+**Matériel :** Python et PyTorch sur CPU pour la miniature. GRPO de LLM demande ensuite l’environnement et les ressources adaptés.
 
-### Task generator
+## 2. Contrat de tâche et séparation
 
-**Définition concrète.** Procédure créant des prompts et vérités de référence.
+Tâche choisie : addition d’entiers positifs, réponse JSON stricte `{"answer": entier}`. Le générateur conserve vérité et métadonnées hors du prompt transmis à la policy.
 
+Pour ne pas répartir `a+b` et `b+a` entre train et test comme deux problèmes indépendants, nous groupons par paire canonique d’opérandes. Des seeds différentes seules ne garantissent pas des ensembles disjoints.
 
-**Exemple simple.** Petits problèmes arithmétiques générés avec seed.
+Les groupes ne doivent pas traverser les splits. Si tu veux tester une généralisation à des nombres plus grands ou à un autre type d’opération, construis aussi cette séparation et annonce qu’elle change la distribution.
 
-### Reward test suite
+## 3. Ce que le pilote apprend réellement
 
-**Définition concrète.** Tests unitaires du scorer.
+La miniature reçoit deux actions possibles : utiliser une procédure d’addition déjà codée, ou une procédure de soustraction. Elle apprend à favoriser l’action récompensée.
 
+Le programme contient donc déjà la procédure correcte parmi les candidats. Le pilote ne démontre **ni apprentissage de l’addition, ni raisonnement d’un LLM**. Il valide groupes, vérificateur, collecte, gradients et archivage.
 
-**Exemple simple.** Correct/faux/malformé/cas limite.
+La réussite attendue est calculable exactement sur ces deux actions. Elle est distincte d’un échantillonnage de réponses de texte libre.
 
-### Initial success rate
-
-**Définition concrète.** Taux de réussite de la policy avant RL.
-
-
-**Exemple simple.** Évite reward entièrement nulle ou déjà saturée.
-
-### Online samples
-
-**Définition concrète.** Completions générées pendant training.
-
-
-**Exemple simple.** Elles dépendent de la policy courante.
-
-### Holdout task set
-
-**Définition concrète.** Problèmes jamais utilisés dans les updates, pour évaluation.
-
-
-**Exemple simple.** Même générateur mais seeds séparées.
-
-## Intuition simple
-
-Tu construis un petit environnement scientifique : le modèle essaie, le programme corrige, le modèle s’ajuste. Si le correcteur est faux, tout le reste est faux.
-
-## Ce qui se passe réellement sous le capot
-
-1. Choisir une tâche non dangereuse et automatiquement vérifiable.
-2. Écrire générateur + oracle + parser + reward.
-3. Écrire tests unitaires exhaustifs.
-4. Créer train prompts et holdout prompts séparés par seed.
-5. Mesurer success initial et distribution de reward.
-6. Lancer un très petit run online.
-7. Logger reward components, longueur, KL si disponible, success holdout.
-8. Inspecter les plus hauts rewards pour hacking.
-9. Augmenter l’échelle seulement après validation.
-
-## Exemple minimal à comprendre mentalement
-
-Tâche : additions de deux nombres, sortie JSON stricte.
-
-```text
-Prompt: 127 + 58
-Oracle: 185
-Expected output: {"answer":185}
-```
-
-Reward principale = exactitude. Reward format peut être séparée et faible, afin qu’un JSON valide mais faux ne gagne pas presque autant qu’une bonne réponse.
-
-## Formules et notation utiles
-
-Mesures :
-
-```text
-train reward mean
-holdout exact accuracy
-format accuracy
-mean completion length
-```
-
-Le succès doit être démontré surtout par holdout exact accuracy, pas seulement reward train.
-
-## Code minimal observable
+## 4. Laboratoire autonome — Tests, splits, collecte et policy gradient
 
 ```python
 import json
+import random
+from itertools import combinations_with_replacement
+from pathlib import Path
+import torch
 
-def reward(text, expected):
+
+def parse_object(pairs):
+    if len(dict(pairs)) != len(pairs):
+        raise ValueError('Cle dupliquee')
+    return dict(pairs)
+
+
+def reward(text, a, b):
     try:
-        obj=json.loads(text)
-    except Exception:
+        obj = json.loads(text, object_pairs_hook=parse_object)
+    except ValueError:
         return 0.0
-    return 1.0 if obj == {"answer": expected} else 0.0
+    if not isinstance(obj, dict) or set(obj) != {'answer'} or type(obj['answer']) is not int:
+        return 0.0
+    return float(obj['answer'] == a + b)
 
-assert reward('{"answer":185}',185)==1.0
-assert reward('{"answer":184}',185)==0.0
+
+def candidate(a, b, action):
+    # Deux procedures deja fournies. La policy apprend seulement a choisir entre elles.
+    return json.dumps({'answer': a + b if action == 0 else a - b})
+
+
+tests = [(json.dumps({'answer': a + b}), a, b, 1.0) for a in range(5) for b in range(5)]
+tests += [('185', 127, 58, 0.0), ('{"answer":184}', 127, 58, 0.0),
+          ('{"answer":true}', 1, 0, 0.0), ('{"answer":"185"}', 127, 58, 0.0),
+          ('{"answer":185,"answer":184}', 127, 58, 0.0), ('[]', 1, 2, 0.0)]
+for text, a, b, expected in tests:
+    assert reward(text, a, b) == expected
+
+pool = list(combinations_with_replacement(range(1, 21), 2))
+random.Random(42).shuffle(pool)
+train, validation, test = pool[:100], pool[100:130], pool[130:]
+assert set(train).isdisjoint(validation) and set(train).isdisjoint(test) and set(validation).isdisjoint(test)
+torch.manual_seed(42)
+rng = random.Random(123)
+logits = torch.nn.Parameter(torch.zeros(2))
+optimizer = torch.optim.Adam([logits], lr=0.05)
+
+
+def expected_success(tasks):
+    probabilities = logits.detach().softmax(-1).tolist()
+    return sum(sum(probabilities[action] * reward(candidate(a, b, action), a, b)
+                   for action in range(2)) for a, b in tasks) / len(tasks)
+
+
+before_validation = expected_success(validation)
+records = []
+for step in range(1, 81):
+    tasks = rng.choices(train, k=32)
+    distribution = torch.distributions.Categorical(logits=logits)
+    actions = distribution.sample((len(tasks),))
+    answers = [candidate(a, b, action) for (a, b), action in zip(tasks, actions.tolist())]
+    rewards = torch.tensor([reward(answer, a, b) for (a, b), answer in zip(tasks, answers)])
+    advantages = rewards - 0.5
+    loss = -(advantages.detach() * distribution.log_prob(actions)).mean()
+    optimizer.zero_grad(set_to_none=True)
+    loss.backward()
+    optimizer.step()
+    for (a, b), action, answer, value in zip(tasks, actions.tolist(), answers, rewards.tolist()):
+        records.append({'step': step, 'group': [a, b], 'action': action, 'answer': answer, 'reward': value})
+    if step % 20 == 0:
+        print('step=', step, 'train reward=', rewards.mean().item(), 'validation attendue=', expected_success(validation))
+
+root = Path('outputs/project61')
+root.mkdir(parents=True, exist_ok=True)
+(root / 'samples.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in records), encoding='utf-8')
+(root / 'split_manifest.json').write_text(json.dumps({'train': train, 'validation': validation, 'test': test}), encoding='utf-8')
+torch.save({'logits': logits.detach(), 'reward_version': 'strict_integer_sum-v1'}, root / 'selector.pt')
+print('Tests reward :', len(tests), 'groupes train/val/test :', len(train), len(validation), len(test))
+print('Validation avant/apres :', before_validation, expected_success(validation))
+print('Test final attendu :', expected_success(test))
 ```
 
-## Laboratoire guidé
+Le script doit passer **31 tests de reward**, séparer **100/30/80 groupes** et collecter **2560 actions** au cours de 80 updates.
 
-1. Écris 30+ tests du reward.  
-2. Génére 200 réponses baseline et inspecte 50 aléatoirement.  
-3. Si success=0 %, simplifie la difficulté ou construis un curriculum avant un long run.  
-4. Lance GRPO court.  
-5. Évalue toutes les 50–100 updates sur holdout fixe.  
-6. Cherche reward hacking.  
-7. Compare au SFT sur quelques solutions si tu veux comprendre le compromis supervision vs RL.
+La réussite attendue initiale vaut 0.5 et doit augmenter nettement dans ce pilote. Les actions ne modifient pas la définition de l’oracle ; c’est la probabilité de choisir la procédure qui change.
 
-## Ce que tu dois observer
+Les cas du correcteur couvrent des erreurs utiles, mais pas tous les cas limites du module 31. Pour ton projet réel, reprends et étends ce contrat au lieu de prétendre qu’un nombre de tests garantit son exhaustivité.
 
-- Reward train peut augmenter avant holdout.
-- Un curriculum trop facile peut saturer.
-- Le coût de génération peut dominer le coût du projet.
-- Le modèle peut améliorer le format sans améliorer le raisonnement si le reward le permet.
+## 5. Passer à une vraie génération de LLM
 
-## À ne pas confondre
+1. Charge la policy préentraînée/SFT et son template exact.
+2. Donne seulement le problème et le contrat de sortie, pas la cible dans le contexte.
+3. Échantillonne plusieurs réponses et archive le texte avant parsing.
+4. Applique le correcteur testé, avec raisons d’échec séparées.
+5. Mesure succès initial, format, longueur et groupes sans contraste.
+6. Choisis GRPO ou une autre optimisation compatible, avec interface de reward vérifiée.
+7. Fais un budget court avant l’échelle cible ; mesure coût de collecte et coût d’update séparément.
+8. Évalue validation sans updates, sélectionne selon le protocole puis utilise le test final.
 
-- Reward train ≠ holdout accuracy.
-- Online data ≠ dataset fixe.
-- GRPO ≠ besoin obligatoire d’un reward model.
+Le noyau du pilote est un policy gradient à une étape, pas une implémentation complète de GRPOTrainer. Les groupes, ratios, masques de tokens et contraintes de l’algorithme choisi doivent être traités comme au module 34.
 
-## Erreurs fréquentes
+## 6. Si la reward ne donne aucun contraste
 
-- Reward non testée.
-- Aucun holdout.
-- Inspecter seulement des exemples réussis.
-- Faire une tâche complexe avant d’avoir validé le pipeline sur une tâche simple.
+Avec presque tous les scores à zéro : vérifie d’abord parser, format, troncature et oracle sur les sorties réelles. La tâche peut aussi être trop difficile pour le modèle de départ.
 
-## Exercices
+Un curriculum ou un petit SFT peuvent augmenter la réussite initiale ; ce sont des interventions à mesurer et à compter dans le budget. Si toutes les réponses réussissent déjà, augmente la difficulté selon une règle définie avant de déclarer un gain.
 
-1. Conçois une autre tâche vérifiable non ambiguë.
-2. Explique comment détecter une reward trop sparse.
-3. Définis un curriculum de trois niveaux.
+Le shaping de format peut enseigner seulement le format. Conserve l’exactitude globale et la mesure indépendante, pas seulement la somme des rewards.
 
-## Validation — avant de continuer
+## 7. Audit et livrables
 
-Tu dois pouvoir, sans simplement réciter le code :
+Remets générateur et version, splits/groupes, correcteur et tests, baseline, configuration de collecte/training, échantillons bruts, composantes de reward, longueur, métriques KL si utilisées, checkpoints et procédure de reprise.
 
-- Tests reward complets.
-- Baseline de reward/success.
-- Run online court reproductible.
-- Gain sur holdout et audit anti-hacking.
+Inspecte les hauts rewards pour les exploits du contrat. Un juge indépendant ou un vérificateur de validation distinct peut aider à détecter une réussite artificielle, sans garantir seul une vérité universelle.
+
+Le rapport doit distinguer réussite sur problèmes vus, nouvelles instances du même régime et changements de distribution. Le gain sur une famille ne prouve pas un raisonnement général.
+
+## 8. Exercices avec corrigés
+
+### Exercice 1 — Seeds
+
+Pourquoi deux générateurs avec seeds différentes peuvent-ils produire les mêmes additions ?
+
+<details>
+<summary>Corrigé</summary>
+
+Leurs tirages peuvent se recouvrir dans le même espace fini. Il faut vérifier et partitionner les groupes, pas seulement changer la graine.
+
+</details>
+
+### Exercice 2 — Procédure fournie
+
+Pourquoi le succès du sélecteur ne prouve-t-il pas l’apprentissage de l’arithmétique ?
+
+<details>
+<summary>Corrigé</summary>
+
+L’action correcte appelle déjà une addition programmée. La policy apprend laquelle des procédures fournies choisir, pas à produire la procédure ni le calcul elle-même.
+
+</details>
+
+### Exercice 3 — Sparse reward
+
+Que vérifier avant d’assouplir le correcteur quand tout vaut zéro ?
+
+<details>
+<summary>Corrigé</summary>
+
+Sorties brutes, parsing, format, longueurs/troncature, vérité de référence et difficulté. Assouplir aveuglément peut accepter des réponses fausses.
+
+</details>
+
+### Exercice 4 — Test final
+
+Les résultats du test guident tes prochains réglages. Quel rôle ce test a-t-il commencé à jouer ?
+
+<details>
+<summary>Corrigé</summary>
+
+Un rôle de développement/validation. Il faut reconnaître cette réutilisation et prévoir une estimation finale adaptée.
+
+</details>
+
+## 9. Critères de fin
+
+- [ ] Correcteur et générateur sont versionnés et testés.
+- [ ] Groupes et vérités ne fuient pas entre splits ni dans le prompt.
+- [ ] Le taux initial et le contraste de groupes sont mesurés.
+- [ ] Les générations online et leurs scores restent auditables.
+- [ ] Succès réservé, format, longueur, coût et limites sont rapportés.
+- [ ] Le pilote de sélection n’est pas présenté comme un LLM qui raisonne.
 
 ## Fiche mémo
 
-Le RL vérifiable devient scientifique lorsque **l’oracle est fiable et le holdout indépendant**.
+```text
+Un oracle clair, des groupes réservés et des sorties brutes avant le grand run.
+Optimiser le reward ne suffit pas : vérifier la tâche réellement apprise.
+```
 
-## Lien avec le module suivant
-
-Le projet 7 assemble tout le parcours : tokenizer et modèle from scratch, puis SFT et post-training optionnel.
-
----
-
-> **Règle de progression :** si un point de la validation n’est pas clair, refais le micro-exemple et le laboratoire. Le but est de construire un modèle mental solide, pas d’accumuler des commandes.
+Le [projet 62](62_projet_7_llm_from_scratch_de_bout_en_bout.md) assemble les composants du modèle de langage lui-même.

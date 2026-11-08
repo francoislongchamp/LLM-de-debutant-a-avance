@@ -1,143 +1,176 @@
-# Module 33 — Reward hacking et robustesse
+# Module 33 — Chercher les réponses qui trompent le reward
 
-## Pourquoi ce module arrive ici
+## 1. Ce que tu vas apprendre
 
-Une policy optimise le signal fourni, pas l’intention humaine cachée derrière ce signal. Toute différence entre métrique et objectif réel peut devenir une voie d’exploitation.
+Une policy peut recevoir une excellente note sans satisfaire l’intention du concepteur. Ce décalage est souvent appelé **reward hacking** ou *specification gaming*.
 
-## Objectifs
+Tu vas fabriquer des contre-exemples, comparer un proxy à un critère indépendant et décider ce qu’il faut revoir avant de poursuivre l’optimisation.
 
-Comprendre specification gaming/reward hacking, proxies, distribution shift et overoptimization. Construire des tests adversariaux de reward et séparer reward de métriques d’évaluation indépendantes.
+**Prérequis :** modules 29 à 32.
 
-**Prérequis :** Les modules précédents.  
-**Temps indicatif :** 45 à 90 minutes, laboratoire compris.  
-**Niveau :** Reinforcement learning
+**Temps indicatif :** 90 à 150 minutes.
 
-## Définitions concrètes
+**Matériel :** Python uniquement ; pas d’exécution de code généré.
 
-### Reward hacking
+## 2. Proxy et objectif réel
 
-**Définition concrète.** Comportement obtenant un reward élevé sans accomplir correctement l’objectif réel.
+Un **proxy** est une mesure indirecte : longueur pour complétude, mots-clés pour pertinence, style assuré pour exactitude.
 
+Ces indices peuvent être corrélés à de bonnes réponses dans un échantillon initial. Les optimiser fortement peut favoriser des sorties qui conservent l’indice et perdent la qualité.
 
-**Exemple simple.** Répéter un mot-clé qui trompe le scorer.
+Exemples :
 
-### Proxy
+| Proxy récompensé | Contre-exemple |
+| --- | --- |
+| Mentionner `306` | « La réponse n’est pas 306 » |
+| Beaucoup de caractères | Répéter une phrase sans information |
+| JSON valide | Objet correct syntaxiquement mais valeur fausse |
+| Ton confiant | Affirmer une erreur avec assurance |
 
-**Définition concrète.** Mesure indirecte utilisée à la place du véritable objectif.
+La référence à la loi de Goodhart décrit ce type de risque ; ce n’est pas une formule qui prouve qu’un proxy échouera dans chaque expérience.
 
+## 3. Distinguer score de train et mesure indépendante
 
-**Exemple simple.** Longueur comme proxy de “détail”.
+Une **évaluation indépendante** ne doit pas être simplement le même reward renommé. Elle peut être un autre test de réussite, un audit humain à l’aveugle ou une vérification fonctionnelle adaptée.
 
-### Overoptimization
+Elle reste imparfaite et peut devenir un outil de développement si tu la consultes sans cesse. Préserve donc aussi un test final et versionne les corrections de reward.
 
-**Définition concrète.** Optimisation poussée d’un proxy au point de dégrader la qualité réelle.
+Reward en hausse et qualité indépendante en baisse signalent une divergence à examiner ; ils ne suffisent pas à identifier seuls la cause exacte.
 
+## 4. Laboratoire autonome — Un scorer de mots-clés attaqué
 
-**Exemple simple.** Reward monte mais jugement indépendant baisse.
-
-### Goodhart’s law
-
-**Définition concrète.** Idée qu’une mesure peut devenir moins fiable lorsqu’elle devient une cible fortement optimisée.
-
-
-**Exemple simple.** Le modèle exploite ce qui était seulement corrélé à la qualité.
-
-### Holdout evaluator
-
-**Définition concrète.** Évaluation indépendante non utilisée directement comme reward de training.
-
-
-**Exemple simple.** Tests fonctionnels ou rubric séparée.
-
-## Intuition simple
-
-Si tu récompenses un élève au nombre de pages, il peut écrire beaucoup sans répondre mieux. Ce n’est pas un bug de l’optimisation : elle suit exactement la règle donnée.
-
-## Ce qui se passe réellement sous le capot
-
-1. Identifier les proxies utilisés dans la reward.
-2. Créer des sorties conçues pour maximiser chaque proxy sans satisfaire l’objectif.
-3. Tester le scorer sur ces sorties.
-4. Pendant training, logger reward et métriques indépendantes.
-5. Inspecter les exemples aux rewards les plus élevés.
-6. Arrêter/réviser si reward monte mais qualité indépendante stagne ou baisse.
-7. Versionner les changements de reward et repartir d’une comparaison propre.
-
-## Exemple minimal à comprendre mentalement
-
-Reward naïve :
+La colonne `expected_success` contient ici une annotation déterminée à partir du contrat « entier seul, exactement 306 ». Ce sont des cas construits pour tester le proxy, pas une mesure d’un modèle réel.
 
 ```python
-reward = min(len(answer)/500, 1.0)
+
+def proxy(answer):
+    return float('306' in answer)
+
+
+def strict_integer_contract(answer):
+    return float(answer.strip() == '306')
+
+
+cases = [
+    {'answer': '306', 'expected_success': 1},
+    {'answer': '308', 'expected_success': 0},
+    {'answer': 'La reponse n est pas 306.', 'expected_success': 0},
+    {'answer': '306 308 309', 'expected_success': 0},
+    {'answer': 'x306x', 'expected_success': 0},
+    {'answer': '306 ' , 'expected_success': 1},
+]
+for row in cases:
+    observed = proxy(row['answer'])
+    checked = strict_integer_contract(row['answer'])
+    assert checked == row['expected_success']
+    print(repr(row['answer']), 'proxy=', observed, 'contrat=', checked)
+
+false_acceptances = [row['answer'] for row in cases
+                     if proxy(row['answer']) == 1 and row['expected_success'] == 0]
+print('Fausses acceptations du proxy :', len(false_acceptances))
+print('Score moyen proxy :', sum(proxy(row['answer']) for row in cases) / len(cases))
+print('Reussite selon le contrat :', sum(row['expected_success'] for row in cases) / len(cases))
 ```
 
-Une réponse de 500 caractères reçoit le maximum, même si elle répète la même phrase. La longueur était corrélée à la complétude mais n’est pas la complétude.
+Tu dois retrouver **3 fausses acceptations**, un score proxy de **5/6**, contre **2/6** de réussites selon le contrat.
 
-## Formules et notation utiles
+Le correcteur strict résout ces cas pour ce format particulier. Il ne remplace pas le parser JSON du module 31 ni tous les tests d’une autre tâche.
 
-On peut suivre la corrélation entre reward de training `R` et score indépendant `E`. Si `R↑` alors que `E↓`, l’optimisation exploite probablement une divergence entre proxy et objectif. La corrélation ne prouve pas la causalité, mais c’est un signal d’alarme.
+Le scorer faible n’est pas « conscient de tricher ». La comparaison montre simplement un objectif numérique qui accepte des événements indésirables.
 
-## Code minimal observable
+## 5. Construire un audit adversarial utile
 
-```python
-def bad_reward(answer):
-    return min(len(answer)/500, 1.0)
+Commence par écrire des familles de défauts : réponses multiples, bonnes valeurs dans une négation, texte parasite, type incorrect, répétitions, clés ambiguës et sorties tronquées.
 
-normal = "Réponse correcte et concise."
-spam = ("mot " * 200).strip()
-print(bad_reward(normal), bad_reward(spam))
-```
+Pour chaque cas, conserve : sortie brute, décision attendue, score reçu, règle violée et version du correcteur. Un test qui échoue devient une information de développement ; ajoute d’autres cas réservés pour ne pas juger la robustesse uniquement sur ceux utilisés pour réparer.
 
-## Laboratoire guidé
+Inspecte aussi les meilleures sorties du run, pas seulement les échecs. Un exploit peut être concentré parmi les rewards maximaux et rester peu visible dans une moyenne globale.
 
-1. Prends ta reward du module 31/32.  
-2. Écris 20 sorties volontairement absurdes mais susceptibles de gagner du score.  
-3. Classe les failles trouvées.  
-4. Ajoute des tests qui doivent échouer.  
-5. Définis au moins une métrique holdout indépendante.  
-6. Pendant un petit run, inspecte les 20 réponses à reward maximal.
+## 6. Réviser sans déplacer silencieusement l’expérience
 
-## Ce que tu dois observer
+Si tu changes la reward au milieu d’un run, la courbe avant/après ne représente plus exactement le même objectif. Note le point de changement, garde l’ancienne version et rescrore des sorties archivées sous les deux conventions si nécessaire.
 
-- Les extrêmes de reward révèlent souvent les raccourcis.
-- Ajouter une pénalité peut créer une nouvelle faille ailleurs.
-- Une reward model apprise peut aussi être hackée.
+Pour une comparaison propre, on peut reprendre depuis un checkpoint identifié et lancer deux branches avec leurs règles explicites. Ne présente pas leur différence comme provenant uniquement d’un LR si la reward a aussi changé.
 
-## À ne pas confondre
+Ajouter une nouvelle pénalité peut créer un autre raccourci. Les composantes du module 32 doivent rester observables et les contraintes être testées.
 
-- Reward hacking ≠ hacking informatique; c’est l’exploitation du critère d’optimisation.
-- Reward élevé ≠ qualité réelle.
-- Ajouter plus de règles ≠ garantie de robustesse.
+## 7. Prolongement avec une policy
 
-## Erreurs fréquentes
+1. Mesure le taux initial de succès du reward et du critère indépendant sur les mêmes sorties.
+2. Lance un petit entraînement avec la règle auditée.
+3. Conserve des échantillons de différents niveaux de reward et de différentes longueurs.
+4. Compare l’accord entre score optimisé et réussite réelle au fil des updates.
+5. Si cet accord se dégrade, inspecte les nouvelles formes de réponse avant d’augmenter le compute.
 
-- Regarder uniquement la moyenne de reward.
-- Utiliser le même juge pour entraîner et conclure à la réussite.
-- Ne pas tester les valeurs extrêmes.
+Un reward appris peut aussi être exploité : la policy produit des réponses éloignées des exemples sur lesquels le juge était fiable.
 
-## Exercices
+## 8. Exercices guidés
 
-1. Trouve trois proxies risqués pour “bonne réponse”.
-2. Explique Goodhart avec ton propre exemple.
-3. Propose un holdout evaluator pour une tâche de code ou JSON.
+- Crée dix textes contenant la bonne réponse sans respecter le contrat ; vérifie les fausses acceptations.
+- Prends un bonus de longueur et construis une sortie répétitive qui atteint le maximum sans répondre.
+- Répare une famille de cas et conserve une autre famille hors des modifications. Compare les deux taux d’erreur.
+- Imagine une tâche de code : distingue tests de format, tests fonctionnels et isolation de l’exécution. Ce module ne propose pas de lancer du code généré dans ton environnement de travail.
 
-## Validation — avant de continuer
+## 9. Exercices avec corrigés
 
-Tu dois pouvoir, sans simplement réciter le code :
+### Exercice 1 — Une note élevée
 
-- Définir reward hacking.
-- Créer un test adversarial de reward.
-- Séparer reward et évaluation indépendante.
-- Diagnostiquer reward↑ / qualité↓.
+Un JSON valide reçoit 1, même si la réponse est fausse. Quel objectif a été optimisé ?
+
+<details>
+<summary>Corrigé</summary>
+
+La conformité syntaxique ou structurelle définie par ce correcteur. Il manque un contrôle de contenu pour affirmer une réussite de la tâche.
+
+</details>
+
+### Exercice 2 — Reward et qualité divergent
+
+Reward train monte, audit indépendant baisse. Faut-il immédiatement augmenter le nombre d’updates ?
+
+<details>
+<summary>Corrigé</summary>
+
+Non. Il faut chercher les différences entre proxy et objectif, examiner les hauts rewards et les changements de distribution. Davantage d’optimisation peut accentuer le problème.
+
+</details>
+
+### Exercice 3 — Réparation et test
+
+Pourquoi ne pas mesurer la robustesse uniquement sur les cas qui ont servi à corriger le parser ?
+
+<details>
+<summary>Corrigé</summary>
+
+Ils sont devenus des données de développement. Il faut aussi des cas réservés et de nouvelles sorties pour vérifier que la correction dépasse ces exemples précis.
+
+</details>
+
+### Exercice 4 — Versionnement
+
+Le score passe de 0.6 à 0.9 après un changement de reward. Peut-on annoncer un gain de réussite ?
+
+<details>
+<summary>Corrigé</summary>
+
+Pas directement : les deux nombres peuvent noter des critères différents. Rescore selon une convention commune et utilise une mesure de réussite indépendante.
+
+</details>
+
+## 10. Validation — avant de continuer
+
+- [ ] Je décris le proxy et l’objectif qu’il est censé représenter.
+- [ ] Je retrouve les trois fausses acceptations du laboratoire.
+- [ ] Je construis des tests adversariaux avec décision attendue.
+- [ ] Je distingue réparation sur développement et test réservé.
+- [ ] Je versionne une modification et conserve les sorties brutes.
 
 ## Fiche mémo
 
-Plus un signal est optimisé, plus ses imperfections deviennent importantes. La robustesse de la reward est une partie du training, pas un détail.
+```text
+Chercher ce qui maximise le score sans accomplir la tâche.
+Auditer les extrêmes et comparer à un critère distinct.
+Un correcteur réparé sur quelques exemples reste à tester ailleurs.
+```
 
-## Lien avec le module suivant
-
-Le module 34 introduit GRPO, une méthode online qui compare plusieurs générations d’un même prompt.
-
----
-
-> **Règle de progression :** si un point de la validation n’est pas clair, refais le micro-exemple et le laboratoire. Le but est de construire un modèle mental solide, pas d’accumuler des commandes.
+Le [module 34](34_grpo.md) utilise des groupes de réponses notées pour optimiser une policy.

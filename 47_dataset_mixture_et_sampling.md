@@ -1,166 +1,176 @@
-# Module 47 — Dataset mixture et sampling
+# Module 47 — Choisir la proportion de tokens réellement vus
 
-## Pourquoi ce module arrive ici
+## 1. Ce que tu vas apprendre
 
-Après nettoyage, plusieurs sources restent. Leur simple concaténation laisse les plus grandes dominer. La mixture rend explicite la proportion de tokens que le modèle voit de chaque domaine/langue.
+Concaténer des sources laisse leur taille naturelle décider de l’exposition. Une **mixture** choisit une distribution d’entraînement, mais tirer 50 % des documents d’une source ne donne pas forcément 50 % des tokens.
 
-## Objectifs
+Tu vas calculer les tokens cibles, les répétitions implicites et une probabilité de tirage adaptée à des longueurs différentes.
 
-Comprendre mixture weights, sampling probability, upsampling/downsampling, epochs implicites par source et température de sampling. Construire une mixture mesurable en tokens.
+**Prérequis :** modules 25, 45 et 46.
 
-**Prérequis :** Les modules précédents.  
-**Temps indicatif :** 45 à 90 minutes, laboratoire compris.  
-**Niveau :** Pré-entraînement — données
+**Temps indicatif :** 90 à 150 minutes.
 
-## Définitions concrètes
+**Matériel :** Python uniquement.
 
-### Mixture
+## 2. Fixer l’unité de mixture
 
-**Définition concrète.** Distribution cible des sources pendant l’entraînement.
+| Proportion souhaitée | Unité à suivre |
+| --- | --- |
+| Nombre de documents | Documents tirés |
+| Positions d’entrée | Tokens non PAD ou cases selon la convention |
+| Cibles de loss | Tokens après shift et masques |
+| Temps de calcul | Mesure de durée, dépendante des formes et kernels |
 
+Un même corpus peut avoir ces quatre proportions différentes. Annonce celle qui guide ton sampler et mesure les autres si elles influencent le coût ou l’objectif.
 
-**Exemple simple.** 50 % web, 20 % code, 20 % docs, 10 % livres.
+Après déduplication, les tailles disponibles changent. Recalcule le budget à partir du corpus réellement éligible, pas de sa version brute.
 
-### Sampling weight
+## 3. Calculer les expositions par source
 
-**Définition concrète.** Poids déterminant la probabilité de tirer une source.
+Pour un budget T et des poids de tokens w_i dont la somme vaut 1 :
 
+\[
+T_i=w_iT,\qquad passages_i\approx T_i/T_{disponible,i}
+\]
 
-**Exemple simple.** 0.2 pour code.
+Budget de 1B tokens, dont 20 % de documents de domaine : 200M tokens exposés. Si la source contient 50M tokens disponibles, cela représente environ **quatre passages moyens**.
 
-### Upsampling
+Cela ne crée pas 200M tokens distincts. Un sampling avec remise peut répéter certaines unités plus souvent et ne pas en visiter d’autres, même si le ratio moyen vaut quatre.
 
-**Définition concrète.** Voir une petite source plus souvent que sa proportion naturelle.
+## 4. Documents longs : un biais facile à manquer
 
-
-**Exemple simple.** Un corpus scientifique de 1 % peut fournir 10 % des tokens.
-
-### Downsampling
-
-**Définition concrète.** Réduire la fréquence d’une très grande source.
-
-
-**Exemple simple.** Web 90 % naturel → 50 % training.
-
-### Effective epochs
-
-**Définition concrète.** Nombre moyen de fois où une source est revisitée sous un budget de tokens.
-
-
-**Exemple simple.** Petite source fortement upsamplée peut être vue de nombreuses fois.
-
-### Temperature sampling
-
-**Définition concrète.** Transformation des proportions pour aplatir ou accentuer la distribution.
-
-
-**Exemple simple.** Souvent utilisée pour langues/sources déséquilibrées, avec conventions variables.
-
-## Intuition simple
-
-La mixture est un budget d’attention pédagogique : sur 100 tokens d’entraînement, combien veux-tu consacrer à chaque type de contenu ? Une source dix fois plus petite peut être vue aussi souvent si tu l’upsamples, mais cela augmente le risque de répétition.
-
-## Ce qui se passe réellement sous le capot
-
-1. Mesurer tokens disponibles par source après nettoyage/dedup.
-2. Définir proportions cibles en fonction des objectifs.
-3. Calculer combien de tokens chaque source doit fournir sous le budget total.
-4. Calculer effective epochs/repetition de chaque source.
-5. Ajuster si une petite source serait répétée excessivement.
-6. Échantillonner avec seed et logger source de chaque batch/shard.
-7. Évaluer par domaines pour vérifier les conséquences.
-
-## Exemple minimal à comprendre mentalement
-
-Budget 1B tokens, mixture :
+Deux sources A et B fournissent des documents de 10 et 100 tokens. Avec une probabilité de source 0.5 chacune, leur contribution moyenne vaut :
 
 ```text
-web  50% → 500M
-code 20% → 200M
-docs 20% → 200M
-book 10% → 100M
+A : 0.5 × 10  = 5 tokens par tirage
+B : 0.5 × 100 = 50 tokens par tirage
 ```
 
-Si `docs` ne contient que 50M tokens uniques, atteindre 200M implique environ 4 passages moyens sur cette source.
+La part token de B tend vers **50/55 ≈ 90.9 %**.
 
-## Formules et notation utiles
+Pour viser une mixture de tokens w_i en tirant des documents de longueur moyenne m_i, une correction indicative est `p_i ∝ w_i/m_i`. Les longueurs variables, découpes et règles de fin de flux demandent ensuite une mesure réelle.
 
-Tokens cibles source i :
-
-\[
-T_i=w_iT_{total}
-\]
-
-Effective passes approximatif :
-
-\[
-E_i=\frac{T_i}{T_{available,i}}
-\]
-
-Une valeur très élevée est un signal de répétition potentielle.
-
-## Code minimal observable
+## 5. Laboratoire autonome — Probabilité de document et part token
 
 ```python
-total=1_000_000_000
-weights={"web":.5,"code":.2,"docs":.2,"books":.1}
-available={"web":2_000_000_000,"code":300_000_000,"docs":50_000_000,"books":200_000_000}
+import random
+from collections import Counter
 
-for src,w in weights.items():
-    target=total*w
-    print(src, "target", int(target), "effective passes", target/available[src])
+lengths = {'short': 10, 'long': 100}
+
+
+def simulate(weights, seed=42, draws=10000):
+    sources = list(weights)
+    rng = random.Random(seed)
+    chosen = rng.choices(sources, weights=[weights[source] for source in sources], k=draws)
+    docs = Counter(chosen)
+    tokens = {source: docs[source] * lengths[source] for source in sources}
+    return {'document_share': {source: docs[source] / draws for source in sources},
+            'token_share': {source: tokens[source] / sum(tokens.values()) for source in sources}}
+
+
+uniform_documents = simulate({'short': 0.5, 'long': 0.5})
+corrected = {source: 0.5 / length for source, length in lengths.items()}
+corrected_tokens = simulate(corrected)
+print('Tirage uniforme des sources :', uniform_documents)
+print('Poids corriges par longueur :', corrected_tokens)
+
+budget = 1_000_000_000
+mixture = {'web': 0.5, 'code': 0.2, 'domain': 0.2, 'books': 0.1}
+available = {'web': 2_000_000_000, 'code': 300_000_000,
+             'domain': 50_000_000, 'books': 200_000_000}
+assert abs(sum(mixture.values()) - 1) < 1e-12
+for source, weight in mixture.items():
+    target = budget * weight
+    print(source, 'tokens cibles=', int(target), 'passages moyens=', target / available[source])
 ```
 
-## Laboratoire guidé
+La première simulation doit approcher 50/50 en documents et 9.1/90.9 en tokens. La seconde approche 50/50 en tokens, avec beaucoup plus de documents courts.
 
-1. Mesure tokens disponibles de tes sources.  
-2. Propose une mixture.  
-3. Calcule tokens cibles et effective passes.  
-4. Identifie les sources trop répétées.  
-5. Crée 100 000 tirages simulés et vérifie les proportions empiriques.  
-6. Versionne mixture weights avec chaque run.
+Les proportions ne sont pas exactement celles attendues sur un nombre fini de tirages. La seed rend la simulation reproductible dans cet environnement, pas les fréquences mathématiquement exactes.
 
-## Ce que tu dois observer
+## 6. Température de sampling : annoncer la convention
 
-- La mixture après dédup peut différer fortement de la mixture brute.
-- Upsampling d’une petite source augmente sa répétition.
-- La mixture influence les capacités mais aussi le style et les langues dominantes.
+Une convention utilise `p_i ∝ n_i^a`, avec n_i une taille de source. Pour a=1, les probabilités suivent les tailles ; a=0 donne des sources équiprobables ; 0<a<1 aplatit la distribution.
 
-## À ne pas confondre
+D’autres outils utilisent un paramètre T et un exposant 1/T. Ne compare pas deux valeurs appelées « température » sans lire leur formule et leur unité de taille.
 
-- Mixture weight ≠ taille brute de source.
-- Upsampling ≠ créer de nouvelles informations.
-- Plus de source spécialisée ≠ bénéfice illimité.
+Aplatir la distribution surpondère généralement les petites sources par rapport à leur taille naturelle. Calcule leurs passages moyens pour repérer les répétitions excessives.
 
-## Erreurs fréquentes
+## 7. Fin d’une source et reprise
 
-- Définir des poids sans calculer effective passes.
-- Changer la mixture sans changer l’identifiant du dataset/run.
-- Mesurer seulement la loss globale au lieu de pertes/benchmarks par domaine.
+Décide ce qui arrive lorsqu’une petite source est épuisée : arrêter le mélange, la répéter, rééchantillonner ailleurs ou respecter un quota de tokens restant.
 
-## Exercices
+Ces choix peuvent modifier la mixture et le sens d’une epoch. Conserve état du sampler, RNG, positions dans les sources et compteurs pour une reprise cohérente.
 
-1. Avec budget 500M et weight code 0.3, combien de tokens code ?
-2. Si code disponible=50M, combien de passages moyens ?
-3. Explique le risque de suréchantillonner 20× une petite source.
+En distribué, évite que tous les ranks tirent involontairement les mêmes documents avec le même flux aléatoire. La partition et la synchronisation doivent préserver le protocole choisi.
 
-## Validation — avant de continuer
+## 8. Expériences guidées
 
-Tu dois pouvoir, sans simplement réciter le code :
+1. Remplace les longueurs fixes par des distributions et compare probabilités de source prévues et tokens observés.
+2. Diminue fortement la taille disponible du domaine : calcule le nombre moyen de passages nécessaire avant tout training.
+3. Sur ton corpus, logge source et cibles réellement actives par update. Compare au manifeste de mixture.
+4. Évalue par domaine et langue, pas seulement la loss totale ; une meilleure moyenne peut masquer une perte sur une petite source.
 
-- Calculer tokens par mixture weight.
-- Calculer effective passes.
-- Simuler et vérifier le sampling.
-- Justifier les proportions par objectifs et benchmarks.
+## 9. Exercices avec corrigés
+
+### Exercice 1 — Tokens cibles
+
+Budget 500M, poids code 0.3 : combien de tokens code ?
+
+<details>
+<summary>Corrigé</summary>
+
+**150M tokens** sous cette convention de mixture.
+
+</details>
+
+### Exercice 2 — Répétitions
+
+La source code contient 50M tokens disponibles. Combien de passages moyens pour ce budget ?
+
+<details>
+<summary>Corrigé</summary>
+
+**Trois** en moyenne. Cela ne garantit pas exactement trois visites de chaque document sous un sampling avec remise.
+
+</details>
+
+### Exercice 3 — Unité
+
+50 % de documents d’une source garantit-il 50 % des cibles ?
+
+<details>
+<summary>Corrigé</summary>
+
+Non. Longueurs, frontières, padding et masques peuvent modifier la contribution réelle à la loss.
+
+</details>
+
+### Exercice 4 — Upsampling
+
+Peut-on dire qu’upsampler 20 fois un corpus multiplie par 20 l’information indépendante disponible ?
+
+<details>
+<summary>Corrigé</summary>
+
+Non. Cela augmente l’exposition à son contenu et potentiellement la mémorisation, pas sa diversité intrinsèque.
+
+</details>
+
+## 10. Validation — avant de continuer
+
+- [ ] Je définis l’unité des poids de mixture.
+- [ ] Je calcule tokens cibles et passages moyens.
+- [ ] Je retrouve le biais 90.9 % du cas long.
+- [ ] Je vérifie la mixture observée et la convention de température.
+- [ ] Je définis épuisement, RNG et reprise des sources.
 
 ## Fiche mémo
 
-La mixture transforme des corpus de tailles naturelles en une **distribution d’apprentissage choisie**.
+```text
+Poids de tirage ≠ nécessairement part token.
+Calculer l’exposition et la répétition, puis mesurer la distribution réellement consommée.
+```
 
-## Lien avec le module suivant
-
-Le module 48 passe à plusieurs GPU : d’abord le data parallel classique, avant le sharding FSDP.
-
----
-
-> **Règle de progression :** si un point de la validation n’est pas clair, refais le micro-exemple et le laboratoire. Le but est de construire un modèle mental solide, pas d’accumuler des commandes.
+Le [module 48](48_data_parallel_et_ddp.md) répartit les données entre plusieurs processus.

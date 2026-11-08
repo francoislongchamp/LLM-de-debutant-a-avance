@@ -1,158 +1,187 @@
-# Module 50 — Budget mémoire du training
+# Module 50 — Estimer les postes et mesurer le pic mémoire
 
-## Pourquoi ce module arrive ici
+## 1. Ce que tu vas apprendre
 
-Les erreurs OOM viennent souvent d’une estimation qui ne comptait que les poids. Pour dimensionner une expérience, il faut séparer poids, gradients, optimizer, activations, temporaires, quantification et sharding.
+Les poids ne sont qu’une partie du budget. Tu vas compter des tenseurs réels après une update, distinguer ces octets du pic de l’allocator et associer chaque technique mémoire au poste qu’elle vise.
 
-## Objectifs
+**Prérequis :** modules 5, 17, 20, 23, 24 et 49.
 
-Construire un tableau de budget mémoire, comprendre les composantes dominantes selon LoRA/full FT/contexte et mesurer peak allocated/reserved plutôt que deviner.
+**Temps indicatif :** 90 à 150 minutes.
 
-**Prérequis :** Les modules précédents.  
-**Temps indicatif :** 45 à 90 minutes, laboratoire compris.  
-**Niveau :** Training distribué
+**Matériel :** PyTorch sur CPU ; la mesure CUDA est conditionnelle à un GPU accessible.
 
-## Définitions concrètes
+## 2. Décomposer avant de multiplier
 
-### Weights memory
+| Poste | Dépend principalement de |
+| --- | --- |
+| Poids | Paramètres uniques, représentation, partage, quantification |
+| Gradients | Paramètres concernés et dtype des gradients |
+| Optimizer | Algorithme, états créés, dtypes et éventuelles copies maîtresses |
+| Activations | Batch, séquence, architecture et sauvegardes pour backward |
+| Temporaires | Kernels, compilations, collectives et conversions |
+| Cache | Mode de génération et politique de conservation |
 
-**Définition concrète.** Mémoire des paramètres du modèle.
+Une hypothèse « 16 octets par paramètre » peut décrire un montage poids/gradients/moments/copie maîtresse donné ; elle ne décrit pas tous les entraînements mixtes ni les adapters.
 
+Compter un tenseur partagé deux fois donne une autre erreur. Commence par les objets et dtypes effectivement utilisés.
 
-**Exemple simple.** Nparams×bytes selon stockage.
+## 3. Allocated, reserved et vue système
 
-### Gradient memory
+`memory_allocated` décrit les allocations de tenseurs suivies par l’allocator concerné. `memory_reserved` décrit son pool réservé ; il peut rester élevé après la libération de tenseurs.
 
-**Définition concrète.** Mémoire des gradients des paramètres entraînables.
+La vue système GPU peut inclure contexte CUDA et allocations d’autres composants/processus. Une différence avec PyTorch n’est pas forcément une fuite.
 
+`empty_cache()` ne libère pas des tenseurs encore référencés. Un pic mesuré après un simple forward d’inférence ne valide pas un premier step AdamW, dont les états sont souvent créés au premier usage.
 
-**Exemple simple.** Grande en full FT, petite pour adapters.
+## 4. Micro-budget de notre réseau
 
-### Optimizer memory
+`Linear(16,32)` avec biais : 544 paramètres. `Linear(32,4)` avec biais : 132. Total **676**.
 
-**Définition concrète.** États maintenus par l’optimizer pour paramètres entraînables.
+En FP32 : **2704 octets** de poids et, après backward, autant de gradients si tous participent.
 
+Les deux moments AdamW ajoutent ici `2×676×4 = 5408` octets, plus les compteurs de step observés. Ce n’est pas toute la mémoire du processus : objets, activations et espaces de travail ne sont pas dans cette somme.
 
-**Exemple simple.** Moments Adam, éventuellement master weights selon stack.
-
-### Activation memory
-
-**Définition concrète.** Intermédiaires du forward/backward dépendant fortement de batch et séquence.
-
-
-**Exemple simple.** Peut dominer les longs contextes.
-
-### Temporary buffers
-
-**Définition concrète.** Espaces de travail des kernels/collectives.
-
-
-**Exemple simple.** FlashAttention, GEMM, all-gather, etc.
-
-### Allocated vs reserved
-
-**Définition concrète.** Mémoire réellement allouée à des tenseurs vs pool réservé par l’allocator.
-
-
-**Exemple simple.** PyTorch peut réserver plus que ce qui est actif.
-
-## Intuition simple
-
-Pense à une valise : les poids ne sont qu’un type d’objet. Il faut aussi emporter gradients, carnets de l’optimizer et toutes les notes intermédiaires du forward. Une estimation qui compte uniquement les vêtements oublie le reste de la valise.
-
-## Ce qui se passe réellement sous le capot
-
-1. Calculer mémoire brute des poids.
-2. Identifier paramètres entraînables et dtype gradients.
-3. Identifier l’optimizer et ses états réels dans la stack choisie.
-4. Mesurer activations via un run représentatif.
-5. Ajouter overhead/temporaires.
-6. Mesurer `max_memory_allocated` et `max_memory_reserved`.
-7. Tester avec séquence/batch cible, pas un petit exemple irréaliste.
-8. Introduire une marge opérationnelle plutôt que viser 100 % de VRAM.
-
-## Exemple minimal à comprendre mentalement
-
-Deux expériences sur le même modèle :
-
-```text
-QLoRA, seq=512, batch=1  → base compacte, petites gradients
-Full FT, seq=4096,batch=2 → poids+grad+optimizer+grosses activations
-```
-
-Le second peut consommer un ordre de grandeur supplémentaire même si le nombre de paramètres du modèle n’a pas changé.
-
-## Formules et notation utiles
-
-Poids bruts : `N×bytes`. Mais le budget total est mieux représenté comme :
-
-```text
-M_total ≈ weights + gradients + optimizer + activations + temporaries + fragmentation
-```
-
-Les derniers termes sont souvent mesurés empiriquement.
-
-## Code minimal observable
+## 5. Laboratoire autonome — Compte réel et pic conditionnel
 
 ```python
 import torch
+from torch import nn
 
-torch.cuda.reset_peak_memory_stats()
-# exécuter ici une étape complète forward/backward/step
-print("peak allocated GiB:", torch.cuda.max_memory_allocated()/1024**3)
-print("peak reserved  GiB:", torch.cuda.max_memory_reserved()/1024**3)
+
+def size_bytes(tensors):
+    return sum(tensor.numel() * tensor.element_size() for tensor in tensors)
+
+
+def run(device):
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+    model = nn.Sequential(nn.Linear(16, 32), nn.ReLU(), nn.Linear(32, 4)).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.001)
+    x = torch.randn(8, 16, device=device)
+    y = torch.randn(8, 4, device=device)
+    for _ in range(2):
+        optimizer.zero_grad(set_to_none=True)
+        loss = nn.functional.mse_loss(model(x), y)
+        loss.backward()
+        optimizer.step()
+    states = [value for state in optimizer.state.values() for value in state.values()
+              if isinstance(value, torch.Tensor)]
+    report = {'parameters': sum(p.numel() for p in model.parameters()),
+              'weights_bytes': size_bytes(model.parameters()),
+              'gradient_bytes': size_bytes(p.grad for p in model.parameters() if p.grad is not None),
+              'optimizer_tensor_bytes': size_bytes(states)}
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+        report.update(peak_allocated=torch.cuda.max_memory_allocated(),
+                      peak_reserved=torch.cuda.max_memory_reserved())
+    return report
+
+
+torch.manual_seed(42)
+cpu_report = run(torch.device('cpu'))
+print('CPU :', cpu_report)
+if torch.cuda.is_available():
+    print('CUDA :', run(torch.device('cuda')))
+else:
+    print('Pic CUDA non mesure : aucun GPU accessible dans cet environnement.')
 ```
 
-## Laboratoire guidé
+Le rapport CPU doit retrouver **676**, **2704** pour poids et gradients. Les moments et compteurs sont réellement parcourus plutôt qu’estimés à partir du seul nom d’optimizer.
 
-1. Crée un tableau `component / estimate / measured`.  
-2. Mesure peak pour inference, LoRA et full FT d’un petit modèle si possible.  
-3. Double la sequence length à batch constant et observe.  
-4. Active gradient checkpointing et observe.  
-5. Active QLoRA et observe la composante base.  
-6. Sur FSDP, mesure par rank plutôt que seulement le total système.
+Sur CUDA, les pics incluent davantage que les octets de paramètres listés. Ce petit réseau ne sert pas à comparer les performances de stratégies de LLM ; il montre les unités et le moment de mesure.
 
-## Ce que tu dois observer
+## 6. Associer les techniques aux postes
 
-- Activations peuvent dominer aux longs contextes.
-- Reserved est souvent supérieur à allocated.
-- Une petite modification de séquence/batch peut déclencher un OOM proche de la limite.
+| Technique | Poste ciblé en premier | Ce qui reste |
+| --- | --- | --- |
+| LoRA | Paramètres optimisés, gradients et états associés | Base et chemins d’activations nécessaires |
+| QLoRA | Stockage d’une base quantifiée + petite adaptation | Métadonnées, calcul et activations dans d’autres formats |
+| Micro-batch plus petit | Activations simultanées | Poids et états persistants |
+| Accumulation | Batch logique plus grand sans un grand forward | Gradients accumulés et calcul supplémentaire |
+| Activation checkpointing | Intermédiaires conservés | Recomputation et entrées nécessaires |
+| FSDP | Duplication d’états répartissables | Pics de matérialisation et communication |
 
-## À ne pas confondre
+Leurs effets peuvent se combiner, mais pas en multipliant naïvement leurs ratios idéaux.
 
-- VRAM `nvidia-smi` ≠ `max_memory_allocated`.
-- Poids 4-bit ≠ activations 4-bit.
-- Paramètres gelés ≠ zéro mémoire.
+## 7. Protocole d’une mesure utile
 
-## Erreurs fréquentes
+1. Fixe versions, matériel, modèle, longueur, micro-batch, précision et objectif.
+2. Définis si le pic inclut chargement, première update, warmup, évaluation et sauvegarde.
+3. Mesure le premier step qui initialise les états puis plusieurs steps stabilisés.
+4. Synchronise pour mesurer le temps GPU et garde une convention identique.
+5. Compare dans des processus séparés si nécessaire pour isoler les états vivants.
+6. En distribué, rapporte chaque rank et le maximum, pas seulement la moyenne.
+7. Garde une marge opérationnelle pour longueurs variables et autres phases du run.
 
-- Dimensionner avec un forward inference alors qu’on veut backward.
-- Ne pas inclure la longueur cible.
-- Viser exactement 100 % de VRAM sans marge.
+La valeur doit être une mesure sur le batch et la séquence visés. Un petit cas qui tient ne prouve pas que le batch représentatif tiendra.
 
-## Exercices
+## 8. Expériences guidées
 
-1. Crée un budget qualitatif pour LoRA vs full FT.
-2. Explique quelle composante gradient checkpointing vise.
-3. Explique quelle composante QLoRA vise principalement.
+- Double batch ou longueur en changeant un seul facteur ; compare paramètres inchangés et pic d’activations.
+- Mesure avant/après le premier AdamW step pour voir les états différés.
+- Compare un même problème LoRA/QLoRA/full FT seulement dans des conditions explicites, avec leur qualité.
+- Crée un tableau `poste / estimation / mesure / convention` et note ce qui n’est pas encore mesuré.
 
-## Validation — avant de continuer
+## 9. Exercices avec corrigés
 
-Tu dois pouvoir, sans simplement réciter le code :
+### Exercice 1 — Unités
 
-- Lister toutes les grandes composantes mémoire.
-- Mesurer peak memory.
-- Expliquer l’effet de LoRA/QLoRA/checkpointing/FSDP sur des composantes distinctes.
-- Prévoir une marge avant un long run.
+1 GiB égale-t-il un milliard d’octets ?
+
+<details>
+<summary>Corrigé</summary>
+
+Non. **1 GiB=1024³ octets**, alors que 1 GB=10⁹ octets. Annonce l’unité pour éviter un écart de budget.
+
+</details>
+
+### Exercice 2 — Allocator
+
+Reserved reste élevé après libération d’un tenseur. Est-ce automatiquement une fuite ?
+
+<details>
+<summary>Corrigé</summary>
+
+Non. L’allocator peut garder un pool pour le réutiliser. Il faut distinguer références vivantes, allocated, reserved et vue système.
+
+</details>
+
+### Exercice 3 — Technique
+
+Quelle méthode vise principalement les activations sauvegardées : QLoRA ou activation checkpointing ?
+
+<details>
+<summary>Corrigé</summary>
+
+L’activation checkpointing. QLoRA vise principalement le stockage de la base et le coût des paramètres optimisés via adapters.
+
+</details>
+
+### Exercice 4 — Premier step
+
+Pourquoi mesurer seulement après construction de l’optimizer sous-estime-t-il parfois sa mémoire ?
+
+<details>
+<summary>Corrigé</summary>
+
+Certains états sont créés à la première mise à jour des paramètres concernés. Le step complet doit faire partie du test.
+
+</details>
+
+## 10. Validation — avant de continuer
+
+- [ ] Je retrouve le compte et les octets du réseau miniature.
+- [ ] Je distingue somme de tenseurs, allocated, reserved et mémoire système.
+- [ ] Je mesure la phase qui initialise les états.
+- [ ] Je sais quel poste vise chaque technique.
+- [ ] Je rapporte longueur, batch, phase et unités avec le pic.
 
 ## Fiche mémo
 
-Les techniques mémoire sont complémentaires parce qu’elles ciblent **des composantes différentes** du budget.
+```text
+Estimer par poste, puis mesurer un step représentatif et les autres pics du run.
+Aucune formule de poids seuls ne remplace ce budget complet.
+```
 
-## Lien avec le module suivant
-
-Le module 51 garantit que ce calcul coûteux n’est pas perdu en cas d’arrêt : checkpoints et reprise.
-
----
-
-> **Règle de progression :** si un point de la validation n’est pas clair, refais le micro-exemple et le laboratoire. Le but est de construire un modèle mental solide, pas d’accumuler des commandes.
+Le [module 51](51_checkpoints_et_reprise.md) vérifie que l’état coûteux à produire peut réellement être restauré.

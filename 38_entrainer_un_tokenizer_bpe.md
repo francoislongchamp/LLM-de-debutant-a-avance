@@ -1,160 +1,196 @@
-# Module 38 — Entraîner un tokenizer BPE
+# Module 38 — Entraîner et figer un tokenizer BPE
 
-## Pourquoi ce module arrive ici
+## 1. Ce que tu vas apprendre
 
-Un modèle from scratch ne peut pas réutiliser arbitrairement les IDs d’un tokenizer non choisi. Le tokenizer définit le vocabulaire et donc la taille/semantique des embeddings et de la tête de sortie.
+Le tokenizer fixe les unités et leurs IDs. Une fois les embeddings entraînés, remplacer cette correspondance change le sens des lignes de poids.
 
-## Objectifs
+Tu vas entraîner un BPE local, expliciter son alphabet initial, tester les caractères absents du corpus et sauvegarder une version rechargeable.
 
-Entraîner un petit tokenizer BPE, comprendre initial alphabet, merges, vocab size, special tokens, unk/byte fallback selon implémentation et sauvegarder un tokenizer reproductible.
+**Prérequis :** modules 2, 9, 37.
 
-**Prérequis :** Les modules précédents.  
-**Temps indicatif :** 45 à 90 minutes, laboratoire compris.  
-**Niveau :** Pré-entraînement — tokenizer
+**Temps indicatif :** 90 à 150 minutes.
 
-## Définitions concrètes
+**Matériel :** `tokenizers` et `transformers`, CPU. Aucun modèle ou corpus externe.
 
-### Initial alphabet
+## 2. Les décisions avant les fusions
 
-**Définition concrète.** Unités de départ avant les merges.
+| Choix | Question |
+| --- | --- |
+| Corpus de train | Représente-t-il les textes à traiter, sans utiliser le test pour les merges ? |
+| Normalisation | Préserver casse, accents, espaces et formes Unicode ? |
+| Pré-tokenisation | Quelles frontières et quelle représentation de départ ? |
+| Alphabet initial | Comment encoder un caractère non observé ? |
+| Tokens spéciaux | Quels IDs et quelle fonction dans le pipeline ? |
+| Budget de vocabulaire | Quel coût de séquence contre quel coût d’embedding ? |
 
+BPE fusionne des paires selon son apprentissage. **Byte-level** décrit ici la représentation basée sur les octets ; cela ne signifie pas que tous les tokens finaux sont des octets isolés.
 
-**Exemple simple.** Caractères ou octets selon l’implémentation.
+Une configuration ByteLevel sans alphabet initial complet peut dépendre davantage des octets observés à l’apprentissage. Nous fournissons les 256 unités de départ pour couvrir les chaînes UTF-8, sous les règles de ce pipeline.
 
-### Merge
+## 3. Refaire le compromis de vocabulaire
 
-**Définition concrète.** Fusion d’une paire fréquente en nouvelle unité.
+Un embedding de vocabulaire V et largeur H contient `V×H` nombres. Si sortie et embedding ne sont pas partagés, la tête peut ajouter une matrice de taille comparable.
 
+Passer de V=32 000 à 64 000, avec H=768, ajoute **24 576 000** valeurs dans la table d’entrée seule. Avec une tête indépendante de même taille, le surcoût est encore augmenté.
 
-**Exemple simple.** `t`+`h`→`th`.
+Un grand vocabulaire peut compacter certains textes, mais il faut comparer le corpus réservé et les coûts réels. Il n’apprend pas à lui seul la signification des nouveaux tokens.
 
-### Vocab size
+## 4. Tokens spéciaux : distinguer réservation et insertion
 
-**Définition concrète.** Nombre maximal/cible de tokens appris, incluant selon outil les tokens spéciaux.
+Nous réservons `<pad>`, `<bos>`, `<eos>` et `<unk>`. Leur présence dans le vocabulaire ne demande pas automatiquement de les ajouter à chaque séquence.
 
+Le post-traitement ou le code d’assemblage doit décider où BOS/EOS apparaissent. Pour nos documents, nous ajouterons explicitement EOS quand l’objectif le demande.
 
-**Exemple simple.** 16 000.
+La valeur de PAD n’est pas universellement zéro ; lis l’ID sauvegardé. Le modèle et le collator doivent connaître les mêmes IDs.
 
-### UNK
+## 5. Laboratoire autonome — Entraîner, tester, recharger
 
-**Définition concrète.** Token représentant une unité non représentable dans certains tokenizers.
+Le corpus est minuscule et sert à valider le mécanisme. Les sorties pédagogiques sont écrites dans `outputs/module38/tokenizer/`.
 
-
-**Exemple simple.** `<unk>`; byte-level peut souvent éviter le problème de couverture.
-
-### Normalizer
-
-**Définition concrète.** Étape optionnelle modifiant le texte avant tokenisation.
-
-
-**Exemple simple.** Unicode normalization, lowercase selon design.
-
-### Pre-tokenizer
-
-**Définition concrète.** Découpage préliminaire avant l’algorithme subword.
-
-
-**Exemple simple.** Whitespace ou ByteLevel.
-
-## Intuition simple
-
-BPE commence avec de petites pièces et observe quelles paires sont fréquentes. Chaque fusion crée une pièce plus grande. Après beaucoup de fusions, les motifs fréquents deviennent compacts sans avoir besoin d’un token par mot possible.
-
-## Ce qui se passe réellement sous le capot
-
-1. Choisir un corpus représentatif de la distribution cible.
-2. Définir normalisation et pré-tokenisation.
-3. Initialiser le modèle BPE.
-4. Compter les paires fréquentes dans les unités actuelles.
-5. Fusionner les paires selon l’algorithme jusqu’au budget de vocabulaire/critère.
-6. Réserver les tokens spéciaux avec IDs stables.
-7. Sauvegarder tokenizer et métadonnées.
-8. Tester round-trip et couverture avant de créer le modèle.
-
-## Exemple minimal à comprendre mentalement
-
-Corpus : `bas bas basse`.
-
-Départ : `b a s`. La paire `b a` apparaît 3 fois → fusion `ba`. Puis `ba s` apparaît 3 fois → fusion `bas`. Les merges appris dépendent du corpus et de ses fréquences.
-
-## Formules et notation utiles
-
-Le vocabulaire plus grand peut raccourcir les séquences, mais augmente notamment la matrice d’embedding et souvent le LM head :
-
-\[
-N_{embedding}=V\times H
-\]
-
-Passer V=16k à 64k avec H=1024 ajoute environ `48k×1024 ≈ 49M` valeurs si les poids ne sont pas autrement partagés/structurés.
-
-## Code minimal observable
+Prédis : un emoji absent des trois phrases peut-il être encodé sans UNK grâce à notre alphabet ?
 
 ```python
+import hashlib
+import json
+from pathlib import Path
 from tokenizers import Tokenizer
 from tokenizers.models import BPE
 from tokenizers.trainers import BpeTrainer
 from tokenizers.pre_tokenizers import ByteLevel
 from tokenizers.decoders import ByteLevel as ByteLevelDecoder
+from transformers import PreTrainedTokenizerFast
 
-special = ["<pad>", "<bos>", "<eos>", "<unk>"]
-tok = Tokenizer(BPE(unk_token="<unk>"))
-tok.pre_tokenizer = ByteLevel(add_prefix_space=False)
-tok.decoder = ByteLevelDecoder()
-trainer = BpeTrainer(vocab_size=16000, special_tokens=special)
-tok.train(["data/pretrain.txt"], trainer)
-tok.save("tokenizer/tokenizer.json")
+corpus = [
+    'Le chat dort. Le chat mange. Le chien dort.',
+    'Un batch regroupe des exemples. Un gradient depend de la loss.',
+    'Les tokens representent le texte. Le texte contient des mots et des espaces.',
+]
+special = ['<pad>', '<bos>', '<eos>', '<unk>']
+backend = Tokenizer(BPE(unk_token='<unk>'))
+backend.pre_tokenizer = ByteLevel(add_prefix_space=False)
+backend.decoder = ByteLevelDecoder()
+trainer = BpeTrainer(vocab_size=320, min_frequency=1,
+                     initial_alphabet=ByteLevel.alphabet(), special_tokens=special,
+                     show_progress=False)
+backend.train_from_iterator(corpus, trainer=trainer)
+tokenizer = PreTrainedTokenizerFast(
+    tokenizer_object=backend, pad_token='<pad>', bos_token='<bos>',
+    eos_token='<eos>', unk_token='<unk>', model_max_length=128,
+)
+root = Path('outputs/module38/tokenizer')
+root.mkdir(parents=True, exist_ok=True)
+tokenizer.save_pretrained(root)
+restored = PreTrainedTokenizerFast.from_pretrained(root)
+
+for text in ['Bonjour café 🙂', 'code = 42\n', 'é', 'e\u0301']:
+    ids = restored.encode(text, add_special_tokens=False)
+    decoded = restored.decode(ids, skip_special_tokens=False, clean_up_tokenization_spaces=False)
+    print(repr(text), 'tokens=', len(ids), 'round-trip=', decoded == text,
+          'UNK=', restored.unk_token_id in ids)
+    assert decoded == text
+    assert restored.unk_token_id not in ids
+
+manifest = {
+    'requested_vocab': 320, 'actual_vocab': len(restored),
+    'special_ids': {token: restored.convert_tokens_to_ids(token) for token in special},
+    'corpus_sha256': hashlib.sha256(json.dumps(corpus, ensure_ascii=False).encode()).hexdigest(),
+    'tokenizer_sha256': hashlib.sha256((root / 'tokenizer.json').read_bytes()).hexdigest(),
+    'normalization': 'none', 'pre_tokenizer': 'ByteLevel(add_prefix_space=False)',
+}
+(root / 'manifest.json').write_text(json.dumps(manifest, indent=2), encoding='utf-8')
+print(manifest)
 ```
 
-## Laboratoire guidé
+Les round-trips doivent être vrais et UNK absent sur ces tests. Les IDs spéciaux attendus sont 0,1,2,3 dans l’ordre réservé par ce trainer. Vérifie-les réellement au lieu de généraliser cet ordre à tous les tokenizers.
 
-1. Commence avec un petit corpus afin que l’entraînement soit rapide.  
-2. Entraîne vocab 2k, 8k, 16k.  
-3. Compare la tokenisation de 100 phrases hors train.  
-4. Vérifie les IDs des special tokens.  
-5. Sauvegarde corpus hash/config/vocab size.  
-6. Ne démarre pas le pré-entraînement tant que le tokenizer n’est pas figé pour l’expérience.
+La taille demandée est une cible/budget ; selon le corpus et les contraintes, la taille obtenue peut différer. Compte `len(tokenizer)` pour dimensionner le modèle utilisé avec ce tokenizer.
 
-## Ce que tu dois observer
+## 6. Pourquoi les deux écritures de é comptent
 
-- Vocab plus grand raccourcit souvent certaines séquences mais augmente embeddings/head.
-- Un corpus non représentatif donne une segmentation médiocre hors domaine.
-- Les choix de normalisation peuvent perdre de l’information de façon irréversible.
+Notre pipeline n’impose pas de normalisation Unicode. Le `é` précomposé et la suite `e` + accent combinant peuvent avoir des IDs différents tout en restant visuellement proches.
 
-## À ne pas confondre
+Une normalisation NFC pourrait les rapprocher ; un lowercasing ou une suppression d’accents ferait d’autres transformations. Ces choix peuvent modifier du code, des noms ou des données sensibles à la casse. Définis leur utilité au lieu de les appliquer comme un nettoyage universel.
 
-- BPE ≠ byte-level BPE automatiquement; “byte-level” décrit aussi la représentation/pré-tokenisation.
-- Vocab size ≠ nombre de mots connus.
-- Special token text ≠ rôle automatique sans configuration correcte.
+Décoder les tokens un par un n’est pas toujours un test pertinent avec les octets : plusieurs unités peuvent former ensemble un caractère UTF-8. Vérifie la séquence complète.
 
-## Erreurs fréquentes
+## 7. Figer une version utilisable
 
-- Entraîner le tokenizer seulement sur un échantillon non représentatif.
-- Changer le tokenizer après avoir commencé à entraîner les embeddings.
-- Lowercase automatiquement un corpus où la casse porte du sens sans justification.
+Conserve corpus de train et groupes d’évaluation, code, versions de la bibliothèque, paramètres du trainer, fichiers du tokenizer, hash et IDs spéciaux.
 
-## Exercices
+Le hash identifie des octets ; il ne prouve pas la qualité ni les droits d’utilisation. La provenance du corpus et les décisions de nettoyage restent à documenter.
 
-1. Calcule l’impact paramètres de V=32k→64k pour H=768.
-2. Explique une conséquence d’un tokenizer trop fragmentant.
-3. Explique pourquoi les IDs spéciaux doivent rester stables avec le modèle.
+Après apprentissage des embeddings, changer le tokenizer exige une stratégie explicite de compatibilité et d’entraînement. « Refaire un meilleur vocabulaire » n’est pas un remplacement transparent.
 
-## Validation — avant de continuer
+## 8. Expériences guidées
 
-Tu dois pouvoir, sans simplement réciter le code :
+1. Entraîne des budgets 280,320,400 sur le même corpus. Mesure les tailles réellement obtenues et le nombre de tokens d’un holdout fixe.
+2. Retire l’alphabet complet dans une copie et teste des caractères absents. Ne suppose pas le comportement : observe UNK et round-trip.
+3. Ajoute une normalisation NFC puis compare les deux écritures de é. Documente le changement voulu.
+4. Recharge le tokenizer dans un nouveau processus et compare les mêmes IDs. La sauvegarde doit contenir les règles nécessaires, pas seulement une liste de mots.
 
-- Entraîner/sauvegarder un tokenizer.
-- Expliquer les merges BPE.
-- Calculer l’impact du vocabulaire sur les embeddings.
-- Vérifier special tokens et round-trip.
+## 9. Exercices avec corrigés
+
+### Exercice 1 — Couverture
+
+Pourquoi fournir un alphabet d’octets complet aide-t-il pour un emoji non présent au train ?
+
+<details>
+<summary>Corrigé</summary>
+
+La chaîne UTF-8 reste décomposable en octets représentés dans les unités de départ. Cela n’impose pas une segmentation compacte ni une connaissance sémantique de l’emoji.
+
+</details>
+
+### Exercice 2 — Vocabulaire et matrice
+
+Combien de valeurs dans V=16 000 et H=384 ?
+
+<details>
+<summary>Corrigé</summary>
+
+**6 144 000** valeurs pour l’embedding d’entrée. Partage ou indépendance de la tête doivent être comptés séparément.
+
+</details>
+
+### Exercice 3 — EOS réservé
+
+EOS dans le vocabulaire signifie-t-il qu’il est automatiquement présent à la fin de chaque document ?
+
+<details>
+<summary>Corrigé</summary>
+
+Non. L’insertion dépend du post-traitement et du pipeline. Le laboratoire configure sa signification, puis les futurs scripts doivent décider où l’ajouter.
+
+</details>
+
+### Exercice 4 — Changement tardif
+
+Pourquoi un nouveau mapping ID/token peut-il casser un modèle même si le vocabulaire garde la même taille ?
+
+<details>
+<summary>Corrigé</summary>
+
+Les lignes d’embeddings et de sortie ont appris l’ancien mapping. Une dimension compatible n’assure pas une signification compatible.
+
+</details>
+
+## 10. Validation — avant de continuer
+
+- [ ] Je distingue BPE, ByteLevel, alphabet et normalisation.
+- [ ] Je peux entraîner puis recharger le tokenizer sans téléchargement.
+- [ ] Je vérifie taille réelle, IDs spéciaux, UNK et round-trip.
+- [ ] Je calcule le coût V×H.
+- [ ] Je conserve fichiers, hashes, corpus et configuration.
 
 ## Fiche mémo
 
-Le tokenizer fixe l’alphabet discret du modèle. Une fois les embeddings entraînés, changer cette correspondance ID↔token casse le sens appris.
+```text
+Choix du corpus → alphabet/normalisation → merges → tests → sauvegarde figée.
+Réserver un marqueur ne signifie pas l’insérer automatiquement.
+```
 
-## Lien avec le module suivant
+Le [module 39](39_evaluer_un_tokenizer.md) compare l’efficacité sur des textes réservés.
 
-Le module 39 évalue le tokenizer avant de lui confier des centaines de millions de tokens de training.
+## Référence
 
----
-
-> **Règle de progression :** si un point de la validation n’est pas clair, refais le micro-exemple et le laboratoire. Le but est de construire un modèle mental solide, pas d’accumuler des commandes.
+[Tokenizers : entraînement BPE](https://huggingface.co/docs/tokenizers/en/quicktour) — composants, trainer et sauvegarde.

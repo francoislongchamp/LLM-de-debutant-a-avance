@@ -1,142 +1,216 @@
-# Module 23 — Gradient accumulation et batch effectif
+# Module 23 — Accumuler les gradients sans fausser leur moyenne
 
-## Pourquoi ce module arrive ici
+## 1. Ce que tu vas apprendre
 
-La VRAM limite souvent le nombre de séquences simultanées. L’accumulation permet de faire plusieurs micro-batches avant une mise à jour et d’obtenir un batch effectif plus grand.
+Si un grand batch ne tient pas en mémoire, plusieurs petits calculs peuvent contribuer à une même mise à jour. Tu sais déjà que backward additionne les gradients ; nous allons utiliser cette propriété volontairement.
 
-## Objectifs
+Tu vas compter micro-batches et updates, traiter une dernière fenêtre incomplète et vérifier une équivalence numérique dans un cas contrôlé.
 
-Distinguer micro-batch, batch par device, gradient accumulation, nombre de devices et batch effectif. Calculer optimizer steps et comprendre l’effet sur la dynamique d’entraînement.
+**Prérequis :** modules 7, 8, 17 et 22.
 
-**Prérequis :** Les modules précédents.  
-**Temps indicatif :** 45 à 90 minutes, laboratoire compris.  
-**Niveau :** Optimisation mémoire
+**Temps indicatif :** 90 à 150 minutes.
 
-## Définitions concrètes
+**Matériel :** Python et PyTorch sur CPU.
 
-### Micro-batch
+## 2. Compter ce qui contribue à un step
 
-**Définition concrète.** Exemples traités dans un seul forward/backward local.
+| Terme | Définition concrète |
+| --- | --- |
+| Micro-batch | Exemples traités dans un forward/backward local |
+| Fenêtre d’accumulation | Micro-batches additionnés avant une update |
+| Batch effectif | Ensemble des contributions à cette update |
+| Optimizer step | Moment où les paramètres changent |
 
+Quand les tailles sont régulières sur D appareils :
 
-**Exemple simple.** 1 exemple par GPU.
+\[
+B_{effectif} = B_{par\ appareil}\times D\times A
+\]
 
-### Accumulation steps
+Avec 2 exemples par appareil, 4 appareils et 8 accumulations : **64 exemples par update complète**.
 
-**Définition concrète.** Nombre de micro-batches dont les gradients sont accumulés avant `optimizer.step()`.
+Cette formule nominale ne décrit pas nécessairement le dernier groupe, ni les tokens évalués. Deux séquences peuvent avoir 10 et 1 000 cibles actives ; « deux exemples » ne décrit pas toute la normalisation.
 
+## 3. Dessiner les compteurs
 
-**Exemple simple.** 16 passages avant update.
-
-### Global/effective batch
-
-**Définition concrète.** Nombre total approximatif d’exemples contribuant à une update sur tous les devices.
-
-
-**Exemple simple.** batch/device × devices × accumulation.
-
-### Optimizer step
-
-**Définition concrète.** Une mise à jour effective des paramètres.
-
-
-**Exemple simple.** Se produit après le nombre configuré d’accumulations.
-
-## Intuition simple
-
-Si tu ne peux porter qu’une boîte à la fois, tu peux déposer 16 boîtes au même endroit avant de faire le voyage final. L’accumulation n’augmente pas la mémoire simultanée de 16×; elle retarde la mise à jour pour intégrer plusieurs micro-batches.
-
-## Ce qui se passe réellement sous le capot
-
-1. Forward/backward sur micro-batch 1.
-2. Conserver les gradients.
-3. Forward/backward sur micro-batch 2, etc.
-4. Les frameworks normalisent généralement la loss/gradients selon leur implémentation pour reproduire un batch logique.
-5. Après N accumulations, optimizer step.
-6. Remise à zéro puis nouveau cycle.
-
-## Exemple minimal à comprendre mentalement
+Sur un appareil, avec 5 exemples, micro-batch 2 et accumulation 2 :
 
 ```text
-per_device_batch = 2
-GPUs             = 4
-accumulation     = 8
-
-effective batch = 2×4×8 = 64 exemples/update
+Micro-batch 1 : 2 exemples → backward
+Micro-batch 2 : 2 exemples → backward → step 1 → zero_grad
+Micro-batch 3 : 1 exemple  → backward → step 2 → zero_grad
 ```
 
-Avec 6400 exemples et un epoch, cela représente environ 100 optimizer steps si tout est divisible et sans subtilités de sampler.
+Le batch effectif nominal vaut 4, mais la dernière update utilise 1 exemple. Oublier ce dernier step perd une contribution ; diviser sa loss par 2 comme si deux micro-batches étaient présents réduit son échelle différemment de la moyenne souhaitée.
 
-## Formules et notation utiles
-
-\[
-B_{effective}=B_{device}\times N_{devices}\times A
-\]
-
-Nombre approximatif de steps/epoch :
+Avec N exemples, micro-batch B et accumulation A, un appareil, dernier micro-batch conservé et fenêtre finale appliquée à chaque epoch :
 
 \[
-steps\approx \frac{N_{examples}}{B_{effective}}
+steps = \left\lceil\frac{\lceil N/B\rceil}{A}\right\rceil
 \]
 
-## Code minimal observable
+Les samplers distribués et stratégies de fin d’epoch peuvent modifier les comptes : mesure les contributions réelles.
+
+## 4. Pourquoi la moyenne des moyennes peut être fausse
+
+Deux micro-batches contiennent 2 et 1 exemples. Leurs losses moyennes valent 1 et 4.
+
+```text
+Moyenne des deux moyennes : (1+4)/2 = 2.5
+Moyenne par exemple : (2×1+1×4)/3 = 2
+```
+
+Pour reproduire la moyenne par exemple, on peut calculer chaque somme d’erreurs puis diviser par **l’effectif total réel de la fenêtre** avant backward.
+
+Pour une cross-entropy tokenisée, le dénominateur pertinent est souvent le nombre total de cibles actives, selon l’objectif choisi. La longueur en cases PAD n’est pas ce nombre.
+
+## 5. Laboratoire autonome — Comparer deux calculs équivalents
+
+Le script compare deux updates sur des batches logiques de tailles 4 puis 1 : l’un en une passe par batch logique, l’autre découpé en micro-batches de tailles 2,2 puis 1.
+
+Nous utilisons une simple régression, une loss par exemple et SGD sans momentum. La double précision aide à observer l’équivalence malgré les arrondis.
 
 ```python
-def effective_batch(per_device, devices, accumulation):
-    return per_device * devices * accumulation
+from copy import deepcopy
+import torch
+from torch import nn
 
-print(effective_batch(2, 4, 8))  # 64
+torch.manual_seed(42)
+reference = nn.Linear(1, 1).double()
+accumulated = deepcopy(reference)
+opt_reference = torch.optim.SGD(reference.parameters(), lr=0.01)
+opt_accumulated = torch.optim.SGD(accumulated.parameters(), lr=0.01)
+x = torch.arange(1, 6, dtype=torch.float64).reshape(-1, 1)
+y = 2 * x + 1
+micro_batches = [(x[i:i+2], y[i:i+2]) for i in range(0, len(x), 2)]
+accumulation = 2
+updates = 0
+
+for start in range(0, len(micro_batches), accumulation):
+    window = micro_batches[start:start + accumulation]
+    total_examples = sum(len(x_batch) for x_batch, _ in window)
+
+    # Référence : une moyenne sur le batch logique complet.
+    full_x = torch.cat([x_batch for x_batch, _ in window])
+    full_y = torch.cat([y_batch for _, y_batch in window])
+    opt_reference.zero_grad(set_to_none=True)
+    nn.functional.mse_loss(reference(full_x), full_y).backward()
+    opt_reference.step()
+
+    # Accumulation : chaque somme contribue à la même moyenne logique.
+    opt_accumulated.zero_grad(set_to_none=True)
+    for x_batch, y_batch in window:
+        loss_sum = nn.functional.mse_loss(accumulated(x_batch), y_batch, reduction='sum')
+        (loss_sum / total_examples).backward()
+    opt_accumulated.step()
+    updates += 1
+    print('Update', updates, 'micro-batches=', len(window), 'exemples=', total_examples)
+
+same = all(torch.allclose(left, right, atol=1e-12, rtol=1e-12)
+           for left, right in zip(reference.parameters(), accumulated.parameters()))
+print('Memes parametres finaux :', same)
 ```
 
-## Laboratoire guidé
+Tu dois obtenir **2 updates**, avec **4 puis 1 exemple**, et une comparaison finale vraie.
 
-1. Calcule ton batch effectif actuel.  
-2. Observe la fréquence de `optimizer.step()` ou du global step.  
-3. Garde batch effectif constant avec deux combinaisons micro-batch/accumulation différentes si ta mémoire le permet.  
-4. Compare débit et stabilité.  
-5. Documente aussi le nombre de tokens par batch, car des séquences de longueurs très différentes rendent “64 exemples” moins informatif.
+Chaque backward reconstruit et libère son propre graphe. Le script conserve les gradients, pas tous les graphes précédents. Utiliser `retain_graph=True` n’est pas nécessaire pour cette accumulation.
 
-## Ce que tu dois observer
+## 6. Les endroits où placer les opérations
 
-- Accumulation augmente le temps entre updates.
-- Même nombre d’exemples ≠ même nombre de tokens.
-- Des implémentations distribuées peuvent introduire des détails de synchronisation.
+```text
+Début de fenêtre : zero_grad
+Chaque micro-batch : forward → contribution correctement normalisée → backward
+Fin de fenêtre : clipping éventuel → optimizer step → scheduler step
+```
 
-## À ne pas confondre
+Remettre les gradients à zéro à chaque micro-batch détruit l’accumulation. Faire un step à chaque micro-batch décrit un autre entraînement, car les paramètres changent avant les contributions suivantes.
 
-- Batch effectif ≠ micro-batch.
-- Accumulation ≠ data parallel.
-- Augmenter batch effectif ≠ toujours améliorer la qualité.
+Un trainer peut gérer lui-même les facteurs d’échelle et l’accumulation. Ne divise pas une seconde fois la loss sans connaître son implémentation. Vérifie notamment sa gestion des nombres de tokens actifs et de la dernière fenêtre.
 
-## Erreurs fréquentes
+## 7. Pourquoi « équivalent » demande des conditions
 
-- Comparer learning rates sans considérer batch effectif.
-- Oublier que les derniers batches peuvent ne pas remplir parfaitement la formule.
-- Ne compter que les exemples pour des séquences très variables.
+L’équivalence démontrée repose sur des poids fixes pendant la fenêtre, la même objective additive et la même normalisation.
 
-## Exercices
+Dropout peut modifier les tirages ; BatchNorm dépend des statistiques du micro-batch ; certains calculs et réductions distribuées introduisent des différences numériques. On ne promet donc pas une trajectoire bit à bit identique pour tous les réseaux.
 
-1. Calcule le batch effectif pour 1×2 GPUs×32 accumulation.
-2. Avec 10 000 exemples et batch effectif 80, environ combien de steps/epoch ?
-3. Explique pourquoi tokens/update peut être une métrique plus précise.
+En DDP, la réduction moyenne entre appareils et les effectifs locaux doivent aussi être pris en compte. Si les nombres de cibles diffèrent, une moyenne locale par appareil puis une moyenne de ces moyennes peut ne pas correspondre à la moyenne globale par token.
 
-## Validation — avant de continuer
+## 8. Mémoire et débit
 
-Tu dois pouvoir, sans simplement réciter le code :
+L’accumulation évite de garder tous les exemples simultanément dans les activations d’un grand forward. Les gradients restent en mémoire entre micro-batches.
 
-- Calculer batch effectif.
-- Distinguer micro-batch et optimizer step.
-- Expliquer pourquoi accumulation aide la VRAM.
-- Calculer approximativement les steps.
+Elle ne supprime pas le coût des poids et de l’optimizer. Elle augmente le nombre de forwards/backwards entre updates, et le débit peut être moins bon qu’un micro-batch plus grand si celui-ci tient et utilise mieux le matériel.
+
+Compare tokens réels par seconde, pic mémoire et résultat à budget défini. « Même nombre d’epochs » peut cacher un nombre différent d’updates.
+
+## 9. Expériences guidées
+
+1. Divise volontairement chaque moyenne de micro-batch par A, même dans le groupe final incomplet. Compare au résultat de référence et identifie le facteur erroné.
+2. Passe à 7 exemples et des micro-batches de 3 avec A=2. Prédis les tailles logiques : 6 puis 1.
+3. Calcule micro-batches et updates de ton run réel, puis compare au compteur du trainer.
+4. Sur des réponses de longueurs différentes, compte les cibles actives par micro-batch et explique la moyenne que tu veux reproduire.
+
+## 10. Exercices avec corrigés
+
+### Exercice 1 — Batch nominal
+
+1 exemple par appareil, 2 appareils et 32 accumulations : quel batch nominal ?
+
+<details>
+<summary>Corrigé</summary>
+
+`1×2×32 = 64` exemples par update complète, sous ces hypothèses de tailles régulières.
+
+</details>
+
+### Exercice 2 — Fin incomplète
+
+103 exemples, micro-batch 10, A=4, un appareil et fin appliquée : combien de micro-batches et d’updates ?
+
+<details>
+<summary>Corrigé</summary>
+
+**11 micro-batches**, regroupés en 4,4,3, donc **3 updates**. La dernière update contient 23 exemples, puisque le dernier micro-batch n’en contient que 3.
+
+</details>
+
+### Exercice 3 — Mémoire du graphe
+
+Faut-il garder tous les graphes des micro-batches pour accumuler ?
+
+<details>
+<summary>Corrigé</summary>
+
+Non. Chaque backward ajoute son gradient puis son graphe peut être libéré. Ce sont les champs `.grad` qui restent pour l’update commune.
+
+</details>
+
+### Exercice 4 — Scheduler
+
+À quel niveau avancent normalement clipping et scheduler ?
+
+<details>
+<summary>Corrigé</summary>
+
+Au niveau de la fenêtre logique : clipping sur le gradient accumulé avant l’update, puis scheduler selon les optimizer steps réellement effectués.
+
+</details>
+
+## 11. Validation — avant de continuer
+
+- [ ] Je distingue micro-batch, fenêtre et batch nominal/réel.
+- [ ] Je traite le dernier groupe sans le perdre ni fausser sa moyenne.
+- [ ] Je retrouve l’équivalence du laboratoire et ses conditions.
+- [ ] Je sais quand compter des exemples ou des tokens actifs.
+- [ ] Je place zero_grad, clipping et scheduler au bon endroit.
+- [ ] Je ne normalise pas deux fois avec un framework.
 
 ## Fiche mémo
 
-L’accumulation échange du temps entre updates contre un batch logique plus grand, sans exiger que tous les exemples soient simultanément en mémoire.
+```text
+Accumuler des contributions à une même moyenne, avec des poids fixes.
+Remise à zéro par fenêtre ; backward par micro-batch ; step en fin de fenêtre.
+La dernière fenêtre compte réellement ce qu’elle contient.
+```
 
-## Lien avec le module suivant
-
-Le module 24 économise une autre grosse composante de VRAM : les activations.
-
----
-
-> **Règle de progression :** si un point de la validation n’est pas clair, refais le micro-exemple et le laboratoire. Le but est de construire un modèle mental solide, pas d’accumuler des commandes.
+Le [module 24](24_gradient_checkpointing_et_memoire.md) économise une autre composante : les activations conservées.

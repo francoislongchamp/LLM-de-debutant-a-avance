@@ -1,156 +1,204 @@
-# Module 34 — GRPO
+# Module 34 — Comprendre et observer une optimisation relative par groupes
 
-## Pourquoi ce module arrive ici
+## 1. Ce que tu vas apprendre
 
-Après avoir construit une reward fiable, on peut optimiser une policy à partir de plusieurs générations. GRPO exploite des récompenses relatives au sein d’un groupe de réponses pour un même prompt.
+**GRPO**, *Group Relative Policy Optimization*, construit un signal à partir de plusieurs réponses au même prompt. Les réponses sont notées, puis comparées à leur groupe pour former des avantages.
 
-## Objectifs
+Tu vas calculer ces avantages, distinguer ancienne policy et référence, puis entraîner une miniature avec groupes, ratio et clipping.
 
-Comprendre groupe de completions, reward relative, advantage normalisé au groupe, policy ratio et rôle du contrôle de dérive. Lancer une petite expérience GRPO sur tâche vérifiable.
+**Prérequis :** modules 30 à 33 ; log-probabilités, reward et moyenne de groupe.
 
-**Prérequis :** Les modules précédents.  
-**Temps indicatif :** 45 à 90 minutes, laboratoire compris.  
-**Niveau :** Reinforcement learning
+**Temps indicatif :** deux séances de 60 à 90 minutes.
 
-## Définitions concrètes
+**Matériel :** Python et PyTorch, CPU. Le pilote ne télécharge ni LLM ni corpus.
 
-### Group
+## 2. Pourquoi plusieurs réponses au même prompt ?
 
-**Définition concrète.** Ensemble de plusieurs réponses générées pour le même prompt.
+Un groupe de rewards `[0,0,1,0.5]` a une moyenne de 0.375. Les deux premiers résultats sont en dessous ; les deux derniers au-dessus.
 
-
-**Exemple simple.** 8 completions pour un problème.
-
-### Group-relative signal
-
-**Définition concrète.** Comparaison d’une reward à la distribution du groupe.
-
-
-**Exemple simple.** Une réponse au-dessus de la moyenne reçoit un avantage positif.
-
-### Advantage
-
-**Définition concrète.** Signal indiquant si la génération a fait mieux ou pire que la baseline/groupe.
-
-
-**Exemple simple.** `A_i≈(r_i-mean(r))/std(r)` dans une intuition simplifiée.
-
-### On-policy / online
-
-**Définition concrète.** Les réponses d’entraînement sont générées par la policy courante ou proche.
-
-
-**Exemple simple.** Le dataset de completions évolue pendant training.
-
-### Policy ratio
-
-**Définition concrète.** Rapport entre probabilité sous nouvelle et ancienne/reference policy utilisé dans les objectifs de policy optimization.
-
-
-**Exemple simple.** Contrôle l’ampleur de la mise à jour.
-
-## Intuition simple
-
-Pour un même exercice, demande au modèle plusieurs tentatives. Au lieu de juger une réponse isolée, regarde lesquelles sont meilleures que leurs voisines. Ces différences fournissent le signal d’apprentissage.
-
-## Ce qui se passe réellement sous le capot
-
-1. Échantillonner un batch de prompts.
-2. Générer plusieurs completions par prompt.
-3. Calculer une ou plusieurs reward functions.
-4. Transformer les rewards en signaux relatifs/advantages selon l’algorithme/configuration.
-5. Calculer la loss de policy avec les log-probabilités des tokens générés.
-6. Appliquer les mécanismes de clipping/KL/normalisation configurés.
-7. Mettre à jour la policy.
-8. Recommencer avec de nouvelles générations.
-
-## Exemple minimal à comprendre mentalement
-
-Pour un prompt, rewards :
-
-```text
-[0, 0, 1, 0.5]
-mean = 0.375
-```
-
-Les réponses 1 et 0.5 sont au-dessus de la moyenne; les 0 sont en dessous. L’algorithme utilise une forme de comparaison relative plus précise selon son implémentation.
-
-## Formules et notation utiles
-
-Intuition d’avantage standardisé :
+Une version de l’avantage est :
 
 \[
-A_i=\frac{r_i-\mu_r}{\sigma_r+\epsilon}
+\widehat A_i = \frac{r_i-\mu_{groupe}}{\sigma_{groupe}+\epsilon}
 \]
 
-Cela explique le terme “group relative”. Les variantes/configurations modernes peuvent utiliser d’autres détails; il faut lire la version de l’implémentation utilisée.
+La standardisation et ses variantes doivent être annoncées. Des implémentations proposent d’autres échelles ou agrégations ; « GRPO » ne désigne pas une unique configuration immuable.
 
-## Code minimal observable
+Un groupe uniformément faux et un groupe uniformément correct donnent tous deux un avantage centré nul. Ils n’ont pourtant pas la même réussite absolue : logge cette réussite séparément.
+
+## 3. Trois distributions à ne pas fusionner
+
+| Distribution | Rôle |
+| --- | --- |
+| Policy entraînée | Celle dont les paramètres changent |
+| Ancienne policy de collecte | Celle qui a produit les réponses du lot ; dénominateur du ratio |
+| Référence | Ancre fixe pour une éventuelle pénalité de dérive |
+
+Le ratio de l’objectif proximal compare nouvelle et ancienne policy **sur les mêmes actions observées**. La référence fixe n’est pas interchangeable avec l’ancienne policy qui est renouvelée à la collecte suivante.
+
+GRPO ne nécessite pas le critic appris utilisé par un PPO classique avec value baseline ; il utilise une information relative au groupe. Une reward vérifiable peut fournir les scores sans reward model.
+
+## 4. Lire l’objectif simplifié
+
+Pour une action par réponse, un surrogate courant utilise :
+
+\[
+\rho_i = \exp(\log\pi_\theta(a_i|x)-\log\pi_{old}(a_i|x))
+\]
+\[
+J = mean\left[\min(\rho_i\widehat A_i,
+clip(\rho_i,1-\varepsilon,1+\varepsilon)\widehat A_i)\right]
+-\beta D_{KL}(\pi_\theta\|\pi_{ref})
+\]
+
+On minimise `−J`. Le clipping limite une incitation du surrogate ; il n’impose pas une borne dure sur toutes les probabilités. La KL est un terme distinct, détaillé au module 36.
+
+Avec un LLM, chaque réponse contient plusieurs actions de tokens. Il faut préciser masques, agrégation token/séquence et traitement des fins tronquées : notre cas à une action supprime ces difficultés pour voir le noyau du calcul.
+
+## 5. Laboratoire autonome — Une miniature groupée à deux contextes
+
+La policy choisit parmi trois réponses déjà fournies. Pour le contexte 0, l’action correcte est 0 ; pour le contexte 1, c’est 1. Elle n’apprend pas le français ni une procédure de raisonnement.
+
+Chaque tour collecte de nouveaux groupes, puis fait deux updates sur ces actions avec l’ancienne log-probabilité figée. Une référence uniforme sert uniquement à illustrer la pénalité KL exacte dans ce petit espace.
 
 ```python
-from datasets import load_dataset
-from trl import GRPOTrainer
-from trl.rewards import accuracy_reward
+import torch
 
-trainer = GRPOTrainer(
-    model="Qwen/Qwen3-0.6B",
-    train_dataset=load_dataset("trl-lib/DeepMath-103K", split="train"),
-    reward_funcs=accuracy_reward,
-)
-# Sur un vrai projet, commence petit et inspecte la reward avant trainer.train().
+torch.manual_seed(42)
+logits = torch.nn.Parameter(torch.zeros(2, 3))
+optimizer = torch.optim.Adam([logits], lr=0.05)
+correct = torch.tensor([0, 1])
+reference = torch.full((2, 3), 1 / 3)
+group_size = 16
+beta = 0.02
+clip_epsilon = 0.2
+
+for iteration in range(1, 81):
+    with torch.no_grad():
+        old_distribution = torch.distributions.Categorical(logits=logits.detach())
+        actions = old_distribution.sample((group_size,)).T
+        old_logp = old_distribution.log_prob(actions.T).T
+        rewards = (actions == correct[:, None]).float()
+        std = rewards.std(dim=1, correction=0, keepdim=True)
+        advantages = (rewards - rewards.mean(dim=1, keepdim=True)) / (std + 1e-8)
+
+    for _ in range(2):
+        log_probs = logits.log_softmax(dim=-1)
+        new_logp = log_probs.gather(1, actions)
+        ratio = (new_logp - old_logp).exp()
+        unclipped = ratio * advantages
+        clipped = ratio.clamp(1 - clip_epsilon, 1 + clip_epsilon) * advantages
+        probs = log_probs.exp()
+        kl = (probs * (log_probs - reference.log())).sum(dim=-1).mean()
+        loss = -torch.minimum(unclipped, clipped).mean() + beta * kl
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+
+    if iteration == 1 or iteration % 20 == 0:
+        success = logits.detach().softmax(-1).gather(1, correct[:, None]).mean().item()
+        print('tour=', iteration, 'reward collecte=', rewards.mean().item(),
+              'reussite attendue=', round(success, 4),
+              'groupes sans contraste=', int((std.squeeze(-1) == 0).sum().item()))
+
+final_success = logits.detach().softmax(-1).gather(1, correct[:, None]).mean().item()
+print('Reussite finale attendue :', final_success)
 ```
 
-## Laboratoire guidé
+La réussite attendue commence à 1/3 et doit augmenter nettement sur cette tâche facile. Les groupes sans contraste deviennent possibles même quand la policy réussit bien : presque toutes les réponses d’un groupe peuvent être correctes.
 
-1. Commence avec une tâche vérifiable que tu comprends.  
-2. Mesure les rewards de la policy avant training.  
-3. Utilise un petit nombre de prompts et completions pour inspecter manuellement les groupes.  
-4. Lance un run court.  
-5. Logge reward moyenne, taux de succès, longueur et métriques indépendantes.  
-6. Inspecte les meilleurs/pire groupes.  
-7. Vérifie qu’un gain de reward correspond bien à un gain réel.
+Le nombre de générations est `80 × 2 × 16 = 2560` actions collectées, et le nombre d’updates est 160. Ce ne sont pas des tokens de LLM ni des exemples distincts de connaissance.
 
-## Ce que tu dois observer
+## 6. Ce que le pilote ne remplace pas
 
-- Si toutes les réponses d’un groupe ont le même reward, le signal relatif peut devenir faible selon la méthode.
-- Plus de completions augmente le coût de génération.
-- La reward doit être rapide et robuste car elle est appelée très souvent.
+Il s’agit d’une miniature inspirée du mécanisme groupé proximal, pas d’une reproduction complète d’un entraînement GRPO de LLM ni de toutes ses variantes.
 
-## À ne pas confondre
+Pour un vrai `GRPOTrainer`, vérifie notamment : format des prompts, interface des reward functions, nombre de générations par prompt, contraintes de batch, longueur maximale, variante de loss, règle de normalisation, référence/KL et mode de génération.
 
-- GRPO ≠ DPO : GRPO génère/scorer online, DPO utilise des paires offline.
-- Group reward ≠ majorité vote nécessairement.
-- GRPO ≠ reward model obligatoire : des rewards vérifiables peuvent suffire.
+N’importe quelle fonction `reward(text)` n’est pas automatiquement compatible avec la signature attendue par ta version du trainer. Inspecte quelques completions et leurs métadonnées avant de lancer le long run.
 
-## Erreurs fréquentes
+## 7. Protocole pour une tâche vérifiable réelle
 
-- Lancer GRPO avant d’avoir testé la reward.
-- Utiliser une tâche dont presque tous les groupes ont rewards identiques.
-- Ne pas mesurer la longueur et autres comportements collatéraux.
+1. Réutilise le parser, oracle et tests du module 31.
+2. Sépare les familles de problèmes et mesure la policy initiale.
+3. Conserve les groupes complets avec prompt, réponses, scores et longueurs.
+4. Mesure taux de réussite absolu et part de groupes sans contraste.
+5. Lance un petit budget online ; vérifie les métriques par groupe et le coût de génération.
+6. Évalue un holdout fixe avec un critère indépendant et inspecte les hauts rewards.
 
-## Exercices
+Plus de générations peut donner davantage de contraste ou de couverture, au prix du temps et de la mémoire. Ce n’est pas une garantie de meilleure qualité à compute égal.
 
-1. Calcule mean et advantage intuitif pour [0,1,1,0].
-2. Explique pourquoi 8 générations coûtent plus qu’une.
-3. Compare le flux de données DPO vs GRPO.
+## 8. Expériences guidées
 
-## Validation — avant de continuer
+- Recalcule les avantages de `[0,1,1,0]` puis `[1,1,1,1]` avec l’écart-type population.
+- Compare group_size=4 et 16 sur plusieurs seeds, à nombre de générations annoncé ; ne confonds pas nombre de tours et coût total.
+- Retire seulement la standardisation par l’écart-type et explique le changement d’échelle.
+- Change beta en gardant le reste fixe, puis mesure réussite et KL au lieu de juger seulement la loss.
 
-Tu dois pouvoir, sans simplement réciter le code :
+## 9. Exercices avec corrigés
 
-- Expliquer pourquoi plusieurs completions sont générées.
-- Calculer un signal relatif simple.
-- Distinguer GRPO de DPO.
-- Lancer un mini-run et inspecter des groupes réels.
+### Exercice 1 — Avantages
+
+Pour `[0,1,1,0]`, quels avantages standardisés avec sigma population ?
+
+<details>
+<summary>Corrigé</summary>
+
+Moyenne 0.5 et écart-type 0.5 : avantages environ **[-1,1,1,-1]**, aux effets de l’epsilon près.
+
+</details>
+
+### Exercice 2 — Deux ancrages
+
+Pourquoi la référence fixe n’est-elle pas toujours le bon dénominateur du ratio proximal ?
+
+<details>
+<summary>Corrigé</summary>
+
+Le ratio porte sur la policy qui a réellement collecté ce batch. La référence peut rester inchangée pendant que les collectes utilisent des policies successives.
+
+</details>
+
+### Exercice 3 — Groupe parfait
+
+Tous les rewards valent 1 et les avantages valent zéro. Est-ce un échec de la tâche ?
+
+<details>
+<summary>Corrigé</summary>
+
+Non : le groupe réussit, mais cette règle relative ne distingue pas ses réponses. Il faut logguer réussite absolue et contraste séparément.
+
+</details>
+
+### Exercice 4 — Online ou offline ?
+
+Quelle différence centrale avec DPO standard sur des paires fixes ?
+
+<details>
+<summary>Corrigé</summary>
+
+La boucle étudiée ici collecte et score de nouvelles actions de la policy au cours du training. DPO standard optimise des paires précollectées sans cette collecte online obligatoire dans la boucle.
+
+</details>
+
+## 10. Validation — avant de continuer
+
+- [ ] Je calcule un avantage relatif avec une convention d’écart-type annoncée.
+- [ ] Je distingue policy, ancienne policy et référence.
+- [ ] Je peux suivre collecte, updates et groupes sans contraste dans le pilote.
+- [ ] Je sais ce qui manque pour passer à des séquences de LLM.
+- [ ] Je mesure coût de génération et succès holdout indépendamment du reward train.
 
 ## Fiche mémo
 
-GRPO apprend à partir de **générations online comparées relativement dans un groupe**, scorées par des rewards.
+```text
+Plusieurs réponses au même prompt → scores → avantages de groupe
+→ ratio sur les actions collectées → update → nouvelle collecte.
+Reward absolu et contraste relatif sont deux informations différentes.
+```
 
-## Lien avec le module suivant
+Le [module 35](35_ppo.md) introduit une value baseline apprise et détaille le clipping PPO.
 
-Le module 35 étudie PPO, historique important du RLHF et utile pour comprendre critic, advantage et clipping.
+## Références
 
----
-
-> **Règle de progression :** si un point de la validation n’est pas clair, refais le micro-exemple et le laboratoire. Le but est de construire un modèle mental solide, pas d’accumuler des commandes.
+[DeepSeekMath : introduction de GRPO](https://arxiv.org/abs/2402.03300), [TRL : GRPOTrainer et variantes](https://huggingface.co/docs/trl/en/grpo_trainer).

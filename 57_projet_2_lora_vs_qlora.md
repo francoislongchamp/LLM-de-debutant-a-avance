@@ -1,145 +1,164 @@
-# Module 57 — Projet 2 — LoRA vs QLoRA
+# Module 57 — Projet 2 : mesurer LoRA et QLoRA sur la même tâche
 
-## Pourquoi ce module arrive ici
+## 1. Ce que tu vas construire
 
-QLoRA est souvent présenté comme “presque pareil avec moins de VRAM”. Ce projet te force à mesurer cette affirmation sur ton hardware, ton modèle et ton dataset.
+Deux conditions partent de la même base logique : l’une conserve une représentation non quantifiée, l’autre utilise une base 4 bits et des adapters LoRA.
 
-## Objectifs
+Le projet doit produire un compromis mesuré mémoire/temps/qualité, pas répéter une économie théorique sur les seuls poids.
 
-Comparer LoRA et QLoRA en contrôlant dataset, rank, targets, steps et benchmark. Mesurer mémoire, temps, qualité et contraintes logicielles.
+**Prérequis :** modules 20, 50, 54 et projet 56.
 
-**Prérequis :** Les modules précédents.  
-**Temps indicatif :** 3 à 6 heures en réutilisant le projet 1.  
-**Niveau :** Projet intégrateur
+**Temps indicatif :** analyse courte sur CPU ; plusieurs heures pour des conditions réelles comparables.
 
-## Définitions concrètes
+**Matériel :** Python pour le laboratoire d’analyse. Le vrai chargement QLoRA exige un backend matériel/logiciel compatible ; le pilote CUDA du module 20 constitue un préalable.
 
-### Treatment
+## 2. Poser précisément la comparaison
 
-**Définition concrète.** Condition expérimentale comparée.
+Question d’exemple : « À données, cibles, rang, scaling et budget de training fixés, QLoRA permet-il de respecter une limite mémoire sans perte inacceptable de qualité ? »
 
+Les deux méthodes peuvent avoir un coût et des dynamiques différents. Une première comparaison avec réglages contrôlés isole le changement de représentation ; une recherche de meilleure recette demande un budget de tuning comparable et annoncé.
 
-**Exemple simple.** LoRA BF16 vs QLoRA 4-bit.
+## 3. La matrice d’expériences
 
-### Controlled variables
+| Élément | Condition A | Condition B |
+| --- | --- | --- |
+| Base/révision et tokenizer | Identiques | Identiques |
+| Base chargée | Dtype choisi et documenté | Quantification, NF4/double quant et compute dtype documentés |
+| LoRA | Rang, alpha, cibles, dropout fixés | Même convention de départ |
+| Données et labels | Même version et masques | Même version et masques |
+| Budget | Cibles/updates définies | Même convention |
+| Mesure | Processus et phases définis | Même protocole |
 
-**Définition concrète.** Paramètres maintenus identiques pour isoler l’effet étudié.
+Mesure aussi la base quantifiée **avant adaptation**. Tu peux ainsi distinguer la différence déjà introduite par la quantification de celle observée après training.
 
+## 4. Laboratoire d’analyse — Des chiffres explicitement fictifs
 
-**Exemple simple.** Dataset, rank, targets, seed, steps.
-
-### Peak VRAM
-
-**Définition concrète.** Pic mémoire pendant une étape représentative.
-
-
-**Exemple simple.** Mesuré avec PyTorch/CUDA.
-
-### Throughput
-
-**Définition concrète.** Tokens ou exemples traités par seconde.
-
-
-**Exemple simple.** Permet de quantifier le coût temps.
-
-## Intuition simple
-
-Si tu modifies quantification, rank, targets et LR à la fois, tu compares deux recettes, pas l’effet de QLoRA. Ce projet doit changer le moins de variables possible.
-
-## Ce qui se passe réellement sous le capot
-
-1. Copier la configuration du projet 1.
-2. Définir condition A base non quantifiée + LoRA.
-3. Définir condition B base 4-bit + LoRA.
-4. Garder même budget de training et benchmark.
-5. Mesurer peak VRAM après warmup de quelques steps.
-6. Mesurer tokens/s et wall time.
-7. Évaluer les deux checkpoints.
-8. Répéter si les différences qualité sont petites/bruitées.
-
-## Exemple minimal à comprendre mentalement
-
-Tableau attendu :
-
-```text
-Metric            LoRA      QLoRA
-Peak VRAM         12.1 GB   7.4 GB
-Tokens/s          900       820
-Domain score      84.2      83.8
-General score     77.0      76.9
-Adapter size      65 MB     65 MB
-```
-
-Ces chiffres sont fictifs : ton but est de produire les tiens.
-
-## Formules et notation utiles
-
-Gain mémoire relatif :
-
-```text
-saving = 1 - VRAM_QLoRA / VRAM_LoRA
-```
-
-Mais ne réduis pas la décision à ce nombre : ajoute qualité et temps.
-
-## Code minimal observable
+Le script apprend à vérifier des unités et appliquer un critère de décision. Il ne charge aucun modèle et ne mesure aucun GPU. Remplace les fixtures par tes résultats archivés avant de tirer une conclusion réelle.
 
 ```python
-def saving(normal, quant):
-    return 100*(1-quant/normal)
-print(saving(12.1, 7.4))
+fixtures = [
+    {'condition': 'LoRA', 'peak_allocated_gib': 12.1, 'tokens_per_second': 900,
+     'domain_score_percent': 84.2, 'general_score_percent': 77.0, 'adapter_mib': 65},
+    {'condition': 'QLoRA', 'peak_allocated_gib': 7.4, 'tokens_per_second': 820,
+     'domain_score_percent': 83.8, 'general_score_percent': 76.9, 'adapter_mib': 65},
+]
+base_general_percent = 80.0
+memory_limit_gib = 8.0
+minimum_domain_percent = 83.0
+maximum_general_drop_points = 3.5
+
+for row in fixtures:
+    assert all(row[key] > 0 for key in ['peak_allocated_gib', 'tokens_per_second', 'adapter_mib'])
+    assert 0 <= row['domain_score_percent'] <= 100
+    assert 0 <= row['general_score_percent'] <= 100
+    drop = base_general_percent - row['general_score_percent']
+    accepted = (row['peak_allocated_gib'] <= memory_limit_gib
+                and row['domain_score_percent'] >= minimum_domain_percent
+                and drop <= maximum_general_drop_points)
+    print(row['condition'], 'perte general en points=', drop, 'admissible=', accepted)
+
+normal, quantized = fixtures
+saving = 100 * (1 - quantized['peak_allocated_gib'] / normal['peak_allocated_gib'])
+throughput_change = 100 * (quantized['tokens_per_second'] / normal['tokens_per_second'] - 1)
+print('EXEMPLE FICTIF : economie de pic (%)=', saving)
+print('EXEMPLE FICTIF : variation de debit (%)=', throughput_change)
 ```
 
-## Laboratoire guidé
+Le gain mémoire fictif vaut environ **38.84 %** et le débit baisse d’environ **8.89 %**. Seule QLoRA respecte la limite fictive de 8 GiB dans cet exemple.
 
-1. Exécute A avec une instrumentation mémoire propre.  
-2. Redémarre le processus avant B pour éviter des mesures CUDA polluées.  
-3. Exécute B avec NF4/config documentée.  
-4. Compare les logs de loss.  
-5. Évalue le même benchmark.  
-6. Écris une décision : dans quelles contraintes choisirais-tu chaque méthode ?
+Ces deux nombres ne disent pas que QLoRA sera plus lent ou de même qualité sur ton matériel. Une différence de 0.4 point de domaine demande effectifs et variabilité avant de parler d’équivalence.
 
-## Ce que tu dois observer
+## 5. Réaliser les mesures réelles
 
-- QLoRA réduit principalement la mémoire de la base.
-- Le débit peut être plus bas ou différent selon GPU/kernels.
-- Les différences qualité peuvent être petites face à la variance du run.
+1. Reprends les données, splits, baseline et benchmark du projet 56.
+2. Vérifie séparément un step A et un step B avec la séquence et le micro-batch cibles.
+3. Mesure après chargement, après injection, premier optimizer step et régime stabilisé.
+4. Utilise des processus séparés et garde allocated/reserved, unité GiB et phases identiques.
+5. Mesure cibles ou tokens réels par seconde, temps total et coût d’évaluation.
+6. Choisis les checkpoints selon validation, puis évalue sur le même test réservé.
+7. Archive qualité par catégorie, longueurs et erreurs, pas seulement un total.
 
-## À ne pas confondre
+Le processus séparé évite de garder des références de l’autre condition. `empty_cache()` n’est pas une preuve que le programme n’a plus de tenseurs vivants.
 
-- Économie VRAM ≠ accélération.
-- Même adapter size ≠ même mémoire de base.
-- QLoRA ≠ modèle final obligatoirement utilisé en 4-bit pour toujours.
+## 6. Comparaison fixe ou utilisation de la mémoire gagnée ?
 
-## Erreurs fréquentes
+Une seconde expérience peut augmenter séquence ou micro-batch grâce à QLoRA. C’est une question utile de faisabilité, mais elle change les formes et potentiellement le batch logique.
 
-- Mesurer QLoRA après un LoRA dans le même process sans nettoyer la mémoire.
-- Comparer des learning rates différents sans le dire.
-- Ne pas versionner bitsandbytes/driver/CUDA.
+Ne mélange pas ce résultat avec l’ablation à réglages fixes. Conserve deux tableaux : effet de la quantification à conditions définies, puis meilleure utilisation du budget matériel.
 
-## Exercices
+À stockage d’adapter égal, base et activations peuvent encore demander des mémoires très différentes. Le poids compact de l’adapter ne mesure pas le coût du training.
 
-1. Calcule le saving du tableau fictif.
-2. Explique pourquoi le checkpoint adapter peut avoir la même taille.
-3. Décris un hardware où QLoRA est particulièrement utile.
+## 7. Rechargement et déploiement
 
-## Validation — avant de continuer
+Teste le chargement dans les conditions où tu veux utiliser le résultat. Un adapter appris sur une base quantifiée peut être utilisé dans d’autres montages compatibles, mais changer la représentation de la base peut modifier les sorties.
 
-Tu dois pouvoir, sans simplement réciter le code :
+Une fusion, conversion ou export demande sa propre validation numérique et comportementale. Conserve base/révision, tokenizer, configuration quantifiée et modules supplémentaires.
 
-- Produire une comparaison contrôlée.
-- Mesurer peak VRAM et throughput.
-- Évaluer qualité avec le même benchmark.
-- Écrire un choix conditionnel, pas “QLoRA toujours meilleur”.
+## 8. Livrables et conclusion attendue
+
+Remets configurations A/B, versions matériel/logiciel, sources des données, mesures brutes horodatées ou indexées, résultats appariés, adapters et procédure de rechargement.
+
+Le rapport doit répondre conditionnellement : quelle méthode satisfait les contraintes de mémoire, temps et qualité **mesurées ici** ? Une incompatibilité de backend est un résultat de faisabilité, pas un score nul inventé pour la méthode.
+
+## 9. Exercices avec corrigés
+
+### Exercice 1 — Pic réel
+
+Pourquoi 14 GB contre 3.5 GB de poids idéaux ne donne-t-il pas forcément 75 % d’économie de pic training ?
+
+<details>
+<summary>Corrigé</summary>
+
+Les autres postes ne suivent pas le même ratio : activations, métadonnées, états d’adapter, kernels et temporaires restent présents.
+
+</details>
+
+### Exercice 2 — Taille d’adapter
+
+Pourquoi le même rang/ciblage peut-il donner des adapters de taille semblable ?
+
+<details>
+<summary>Corrigé</summary>
+
+La base quantifiée ne change pas nécessairement les dimensions ou dtypes des A/B sauvegardées. Cela ne signifie pas même coût de base ou même qualité.
+
+</details>
+
+### Exercice 3 — Débit
+
+Une économie mémoire prouve-t-elle une accélération ?
+
+<details>
+<summary>Corrigé</summary>
+
+Non. Kernels, conversions, matériel et formes peuvent améliorer ou réduire le débit. Il faut le mesurer avec une convention temporelle annoncée.
+
+</details>
+
+### Exercice 4 — Séquence modifiée
+
+QLoRA utilise un contexte deux fois plus long que LoRA. Compare-t-on seulement la quantification ?
+
+<details>
+<summary>Corrigé</summary>
+
+Non. C’est une comparaison de recettes ou de faisabilité sous budget, à présenter séparément d’une ablation à formes fixes.
+
+</details>
+
+## 10. Critères de fin
+
+- [ ] Les deux conditions sont identifiables et comparables selon la question annoncée.
+- [ ] Les prérequis matériels sont vérifiés, ou la condition est marquée non exécutée.
+- [ ] Pics, phases, débit et unités sont documentés.
+- [ ] Baselines quantifiée/non quantifiée et résultats finaux sont distingués.
+- [ ] Le rapport inclut qualité, régressions, répétitions utiles et rechargement.
 
 ## Fiche mémo
 
-Le résultat attendu est une **carte de compromis** entre mémoire, vitesse et qualité.
+```text
+Une économie mesurée et un compromis de qualité, sur un matériel et un protocole précis.
+Les fixtures d’analyse ne sont jamais des résultats de training.
+```
 
-## Lien avec le module suivant
-
-Le projet 3 compare maintenant adaptation basse-rang et mise à jour complète.
-
----
-
-> **Règle de progression :** si un point de la validation n’est pas clair, refais le micro-exemple et le laboratoire. Le but est de construire un modèle mental solide, pas d’accumuler des commandes.
+Le [projet 58](58_projet_3_lora_vs_full_fine_tuning.md) compare maintenant deux libertés de mise à jour.

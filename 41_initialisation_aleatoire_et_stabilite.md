@@ -1,145 +1,158 @@
-# Module 41 — Initialisation aléatoire et stabilité
+# Module 41 — Vérifier l’initialisation avant les premières updates
 
-## Pourquoi ce module arrive ici
+## 1. Ce que tu vas apprendre
 
-Un modèle from scratch commence sans structure apprise. Si les poids initiaux ont de mauvaises échelles, les activations ou gradients peuvent disparaître/exploser avant que l’apprentissage ne commence réellement.
+Des poids aléatoires ne signifient pas des poids arbitrairement grands. Leur échelle et leur diversité influencent activations et gradients dès le premier batch.
 
-## Objectifs
+Tu vas comparer trois initialisations sur un petit réseau, observer les normes et éviter d’interpréter une valeur finie comme une preuve de bon apprentissage.
 
-Comprendre pourquoi on initialise avec de petites distributions adaptées, vérifier statistiques des poids/activations et reconnaître NaN, explosion ou symétrie problématique.
+**Prérequis :** modules 4, 7 et 40.
 
-**Prérequis :** Les modules précédents.  
-**Temps indicatif :** 45 à 90 minutes, laboratoire compris.  
-**Niveau :** Pré-entraînement — optimisation
+**Temps indicatif :** 90 à 150 minutes.
 
-## Définitions concrètes
+**Matériel :** PyTorch, CPU.
 
-### Initialization distribution
+## 2. Échelle et symétrie
 
-**Définition concrète.** Règle générant les valeurs initiales des poids.
+Une **distribution d’initialisation** définit comment les valeurs de départ sont générées. Une seed stabilise le tirage dans un environnement donné ; elle n’est pas un choix d’échelle.
 
+Si des unités cachées ont exactement les mêmes poids et reçoivent les mêmes gradients, elles risquent de rester indifférenciées. Une initialisation aléatoire adaptée aide à briser cette symétrie.
 
-**Exemple simple.** Normale de faible écart-type selon l’architecture.
+Des poids trop grands peuvent saturer certaines activations, produire de grands logits ou des gradients mal conditionnés. Des poids trop petits peuvent aussi réduire la propagation du signal. « Le plus petit écart-type possible » n’est donc pas une règle d’initialisation.
 
-### Symmetry breaking
+Les règles Xavier, He et les conventions des Transformers répondent à des hypothèses différentes : activation, largeur, profondeur, résidus et normalisations comptent.
 
-**Définition concrète.** Différences initiales permettant à des neurones similaires d’apprendre des fonctions différentes.
+## 3. Ne pas interdire tous les zéros
 
+Les biais sont souvent initialisés à zéro. Une norme peut commencer avec poids 1 et biais 0. La branche B de LoRA peut être nulle au départ tout en laissant A aléatoire et une base utile.
 
-**Exemple simple.** Tous les poids à zéro seraient problématiques dans de nombreux réseaux.
+Le problème de symétrie ne se résume donc pas à « aucun zéro autorisé ». Notre laboratoire met **les deux matrices** d’un réseau sans biais à zéro pour rendre visible un cas qui bloque les gradients utiles.
 
-### Activation scale
+## 4. Une référence pour la loss initiale
 
-**Définition concrète.** Ordre de grandeur des valeurs dans le forward.
+Sur V classes équiprobables, la cross-entropy d’une cible unique vaut `ln(V)`. Pour V=4 : environ **1.3863**.
 
+Un modèle aléatoire n’est pas nécessairement exactement uniforme. S’il donne une forte probabilité à de mauvaises cibles, sa loss peut être plus grande. Une cross-entropy stable peut aussi rester finie pour de grands logits : « grand » n’implique pas automatiquement NaN.
 
-**Exemple simple.** Valeurs qui explosent couche après couche signalent un problème.
+## 5. Laboratoire autonome — Zéro, petite normale et grande normale
 
-### Gradient scale
-
-**Définition concrète.** Ordre de grandeur des gradients.
-
-
-**Exemple simple.** Très grands, très petits ou NaN sont à surveiller.
-
-### Finite check
-
-**Définition concrète.** Vérification que valeurs/loss ne sont ni NaN ni ±inf.
-
-
-**Exemple simple.** `torch.isfinite(loss)`.
-
-## Intuition simple
-
-Au départ, le réseau est un système de transformations aléatoires. Les valeurs doivent être assez petites pour ne pas exploser, mais suffisamment variées pour que les unités ne soient pas toutes identiques.
-
-## Ce qui se passe réellement sous le capot
-
-1. Instancier le modèle avec l’initialisation de son implémentation.
-2. Inspecter moyenne/écart-type de quelques poids.
-3. Faire un forward sur un batch réel tokenisé.
-4. Vérifier logits et loss finis.
-5. Faire backward et inspecter gradient norms.
-6. Tester quelques dizaines de steps avant tout long run.
-7. Ne modifier l’initialisation qu’avec une hypothèse claire.
-
-## Exemple minimal à comprendre mentalement
-
-Deux extrêmes pédagogiques :
-
-```text
-Poids énormes → activations/logits énormes → softmax/loss instables
-Poids tous identiques → faible diversité/symétrie problématique
-```
-
-Les architectures modernes possèdent leurs conventions; les réimplémenter “à la main” sans raison peut casser cette stabilité.
-
-## Formules et notation utiles
-
-Les méthodes Xavier/He et variantes cherchent à contrôler la variance à travers les couches. Pour les Transformers modernes, suivre l’initialisation prévue par l’architecture est un bon point de départ pédagogique; les détails avancés dépendent du design (résidus, profondeur, normes).
-
-## Code minimal observable
+Nous utilisons Tanh pour observer un exemple de saturation. Les valeurs de sortie sont des scores de quatre classes ; ce réseau n’est pas un Transformer.
 
 ```python
 import torch
+from torch import nn
 
-for name, p in list(model.named_parameters())[:20]:
-    if p.ndim >= 2:
-        print(name, "mean", p.float().mean().item(), "std", p.float().std().item())
+torch.manual_seed(42)
+x = torch.randn(32, 16)
+targets = torch.arange(32) % 4
+reports = []
 
-# après calcul de loss
-print("loss finite?", torch.isfinite(loss).item())
+for name, scale in [('zero', 0.0), ('small', 0.02), ('large', 20.0)]:
+    torch.manual_seed(123)
+    model = nn.Sequential(nn.Linear(16, 32, bias=False), nn.Tanh(),
+                          nn.Linear(32, 4, bias=False))
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.normal_(mean=0.0, std=scale)
+    hidden = model[1](model[0](x))
+    logits = model[2](hidden)
+    loss = nn.functional.cross_entropy(logits, targets)
+    loss.backward()
+    grad_norms = [parameter.grad.norm().item() for parameter in model.parameters()]
+    report = {'name': name, 'loss': loss.item(), 'finite': torch.isfinite(loss).item(),
+              'logits_abs_max': logits.abs().max().item(),
+              'hidden_saturated_fraction': (hidden.abs() > 0.99).float().mean().item(),
+              'gradient_norms': grad_norms}
+    reports.append(report)
+    print(report)
 ```
 
-## Laboratoire guidé
+Pour les poids nuls, les logits et gradients des deux matrices doivent être nuls, tandis que la loss vaut environ **ln(4)**. Avoir une loss et un graphe valides ne suffit pas à recevoir un signal de mise à jour utile.
 
-1. Inspecte stats de 10 matrices.  
-2. Fais forward/backward sur 3 batches.  
-3. Logge loss et global grad norm.  
-4. Fais volontairement une copie expérimentale où tu multiplies certains poids par 100 et observe l’instabilité; ne réutilise pas ce checkpoint.  
-5. Reviens à l’initialisation normale et confirme la stabilité.
+La petite normale donne des scores proches de zéro et des gradients non nuls. La grande normale sature une forte part des hidden states et produit des scores plus grands. Observe les nombres au lieu d’attendre obligatoirement un NaN.
 
-## Ce que tu dois observer
+## 6. Inspecter un Transformer réel de l’expérience
 
-- La moyenne proche de zéro ne suffit pas à garantir une bonne initialisation.
-- Les premières dizaines de steps sont un excellent smoke test.
-- Les NaN peuvent venir des données, du LR, de la précision ou d’autres causes, pas seulement de l’initialisation.
+Commence par l’initialisation prévue par son implémentation. Liste quelques matrices, leur moyenne, écart-type, minimum/maximum et dtype. Compare les normes de logits et gradients après un vrai batch tokenisé.
 
-## À ne pas confondre
+Ne réinitialise pas aveuglément toutes les valeurs d’un modèle chargé : tu détruirais ses poids appris. Une expérience d’initialisation concerne un modèle construit pour démarrer from scratch.
 
-- Initialisation ≠ seed; la seed rend l’aléatoire reproductible, l’initialisation définit sa distribution/règle.
-- Small weights ≠ small model.
-- Loss élevée au step 0 ≠ automatiquement instable.
+Les paramètres de normalisation, biais et projections peuvent avoir des règles différentes. Un résumé global de tous les poids mélange ces rôles.
 
-## Erreurs fréquentes
+## 7. Finite checks et premiers steps
 
-- Modifier l’initialisation avant d’avoir testé la valeur par défaut.
-- Lancer longtemps sans `isfinite`/logging.
-- Attribuer toute NaN à CUDA sans inspecter données et gradients.
+Contrôle successivement : entrées/labels, logits, loss, gradients et paramètres après l’update. La première étape non finie aide à localiser la cause.
 
-## Exercices
+Si tout est fini mais la loss ne descend pas sur un seul batch, vérifie aussi l’optimizer, le LR réellement utilisé et les labels. Une statistique d’initialisation inhabituelle n’est pas automatiquement l’unique cause.
 
-1. Explique pourquoi tous les poids à la même valeur sont risqués.
-2. Liste quatre causes d’une loss NaN.
-3. Explique seed vs initialization.
+Pour comparer des échelles, garde architecture, batch, loss, seed et optimizer fixes. Évalue plusieurs répétitions si une différence petite dépend fortement du tirage.
 
-## Validation — avant de continuer
+## 8. Expériences guidées
 
-Tu dois pouvoir, sans simplement réciter le code :
+1. Essaie des écarts-types intermédiaires et représente saturation, loss et normes de gradients dans un tableau.
+2. Remplace Tanh par ReLU. Explique pourquoi l’histoire de saturation et les règles d’échelle ne sont plus exactement les mêmes.
+3. Sur le modèle du module 40, mesure la loss initiale et compare à ln(V), sans exiger une égalité exacte.
+4. Fais quelques dizaines de steps sur un batch fixe ; logge les statistiques au début et à la fin.
 
-- Inspecter stats de poids.
-- Vérifier loss/gradients finis.
-- Expliquer symmetry breaking.
-- Faire un smoke test avant long training.
+## 9. Exercices avec corrigés
+
+### Exercice 1 — Loss uniforme
+
+V=100 classes avec une distribution uniforme : quelle loss approximative ?
+
+<details>
+<summary>Corrigé</summary>
+
+`ln(100) ≈ 4.6052` nats par cible. Ce repère suppose une distribution uniforme et l’objectif de cible unique décrit.
+
+</details>
+
+### Exercice 2 — Finie mais bloquée
+
+Pourquoi la configuration zéro a-t-elle une loss finie mais aucun gradient utile dans cette miniature ?
+
+<details>
+<summary>Corrigé</summary>
+
+Les entrées de la dernière matrice sont nulles et la rétropropagation vers la première est multipliée par une dernière matrice nulle. Les deux matrices restent sans signal malgré une erreur de classification.
+
+</details>
+
+### Exercice 3 — LoRA
+
+B nulle dans LoRA contredit-elle nécessairement cette observation ?
+
+<details>
+<summary>Corrigé</summary>
+
+Non. Le montage diffère : A peut être aléatoire et B recevoir un premier gradient, sur une base déjà utile. Une seule matrice nulle n’équivaut pas à mettre toutes les matrices d’un réseau à zéro.
+
+</details>
+
+### Exercice 4 — Grands scores
+
+Des logits de grande amplitude doivent-ils toujours faire échouer `cross_entropy` ?
+
+<details>
+<summary>Corrigé</summary>
+
+Non. Son calcul stable peut rester fini. Il faut inspecter amplitude, confiance, gradients et dynamique réelle plutôt que déduire un NaN d’un seul seuil.
+
+</details>
+
+## 10. Validation — avant de continuer
+
+- [ ] Je distingue seed, échelle et règle adaptée à l’architecture.
+- [ ] Je retrouve loss ln(4) et gradients nuls du cas zéro.
+- [ ] Je peux expliquer les limites de ce cas pédagogique.
+- [ ] Je contrôle valeurs et gradients avant puis après une update.
+- [ ] Je ne réinitialise pas un modèle préentraîné par erreur.
 
 ## Fiche mémo
 
-Une bonne initialisation donne un point de départ **numériquement stable et non symétrique**, pas des connaissances.
+```text
+Statistiques des poids → forward réel → loss → gradients → premier step.
+Fini ne signifie pas apprenable ; grand ne signifie pas automatiquement non fini.
+```
 
-## Lien avec le module suivant
-
-Le module 42 écrit la vraie boucle de pré-entraînement causal sur tokens.
-
----
-
-> **Règle de progression :** si un point de la validation n’est pas clair, refais le micro-exemple et le laboratoire. Le but est de construire un modèle mental solide, pas d’accumuler des commandes.
+Le [module 42](42_ecrire_une_boucle_de_pre_entrainement.md) assemble ces vérifications dans la boucle causale.

@@ -1,84 +1,75 @@
-# Module 2 — Tokenisation en profondeur
+# Module 2 — Comprendre comment le texte devient des tokens
 
-## Pourquoi ce module arrive ici
+## 1. Ce que tu vas apprendre
 
-Le module 1 a montré que le modèle ne lit pas directement des mots : il reçoit des identifiants de tokens. Il faut maintenant comprendre comment ces tokens sont construits, car la tokenisation influence la longueur de contexte, le coût, la vitesse et la facilité d’apprentissage.
+Le [module 1](01_pipeline_complet_dun_llm.md) t’a montré que le réseau reçoit des IDs. Ici, nous ouvrons l’outil qui les produit : le **tokenizer**.
 
-## Objectifs
+À la fin, tu devrais pouvoir :
 
-Comprendre vocabulaire, token, token ID, sous-mot, pré-tokenisation, BPE, byte-level, tokens spéciaux et fertility. Savoir inspecter un tokenizer et expliquer pourquoi deux tokenizers peuvent représenter le même texte avec un nombre de tokens très différent.
+- distinguer caractère, octet, mot, token et identifiant ;
+- appliquer quelques fusions BPE à la main ;
+- inspecter un tokenizer réel sans charger les poids du modèle ;
+- mesurer la fragmentation d’un texte et en expliquer les limites ;
+- distinguer entraîner un tokenizer et entraîner un modèle de langage.
 
-**Prérequis :** Les modules précédents.  
-**Temps indicatif :** 45 à 90 minutes, laboratoire compris.  
-**Niveau :** Fondations
+**Prérequis :** module 1 ; listes, chaînes et boucles Python.
 
-## Définitions concrètes
+**Temps indicatif :** 90 à 150 minutes, expériences comprises.
 
-### Token
+**Matériel :** Python pour le premier laboratoire ; Transformers pour le second. Aucun GPU, aucun poids de LLM à charger.
 
-**Définition concrète.** Une unité discrète choisie dans le vocabulaire du tokenizer. Un token n’est pas nécessairement un mot.
+## 2. Cinq objets à ne pas confondre
 
+Prenons `café` :
 
-**Exemple simple.** `cybersécurité` peut devenir un token unique ou plusieurs fragments.
+| Objet | Ce que l’on compte | Pour ce texte |
+| --- | --- | --- |
+| Mot | Une unité linguistique selon une convention | Un mot |
+| Caractère Python | Un point de code Unicode | 4 dans cette écriture |
+| Octet UTF-8 | Une unité du codage en mémoire/fichier | 5 : `é` utilise deux octets |
+| Token | Une unité choisie par un tokenizer donné | Nombre à mesurer |
+| ID | L’adresse numérique d’un token dans son vocabulaire | Dépend du tokenizer |
 
-### Vocabulaire
+Un caractère visible peut parfois être composé de plusieurs points de code : un `é` peut être représenté de différentes manières en Unicode. Ne généralise donc pas « un signe visible = une case Python = un octet ».
 
-**Définition concrète.** La table qui associe chaque token à un entier unique appelé token ID.
+Un tokenizer peut représenter un mot entier, plusieurs fragments ou des unités reposant sur des octets. Le découpage n’est pas une analyse grammaticale obligatoire.
 
+### Pourquoi les sous-mots ?
 
-**Exemple simple.** Avec 50 000 entrées, il existe environ 50 000 IDs possibles.
+Un vocabulaire contenant chaque mot possible serait difficile à maintenir : noms propres, variantes, mots nouveaux et identifiants se multiplient. À l’inverse, représenter tout texte caractère par caractère produit des séquences longues.
 
-### Sous-mot
+Les sous-mots offrent un compromis : conserver des fragments fréquents tout en permettant d’assembler d’autres chaînes. Leur découpage ne suit pas nécessairement les syllabes ni les racines linguistiques.
 
-**Définition concrète.** Un fragment réutilisable plus petit qu’un mot complet.
+## 3. Le pipeline du tokenizer
 
+```text
+Texte
+  ↓ normalisation éventuelle
+Texte normalisé
+  ↓ pré-tokenisation éventuelle
+Morceaux de départ
+  ↓ algorithme de segmentation : BPE, Unigram, etc.
+Tokens et IDs
+  ↓ post-traitement éventuel
+Séquence finale avec marqueurs spéciaux
+```
 
-**Exemple simple.** `authentication` peut être représenté par plusieurs fragments fréquents.
+| Étape | Exemple possible | Effet à examiner |
+| --- | --- | --- |
+| Normalisation | Passer en minuscules ou normaliser Unicode | Peut modifier la forme du texte |
+| Pré-tokenisation | Repérer espaces et ponctuation | Peut fixer des frontières que les fusions ne traverseront pas |
+| Segmentation | Représenter un mot en sous-unités | Détermine les tokens ordinaires |
+| Post-traitement | Ajouter BOS ou EOS | Consomme des positions supplémentaires |
 
-### BPE
+Toutes les configurations n’utilisent pas les mêmes étapes. La normalisation n’est pas forcément activée, et un espace peut faire partie de la représentation d’un token.
 
-**Définition concrète.** Une famille d’algorithmes qui fusionne progressivement les paires fréquentes.
+**Encoder** signifie convertir du texte en IDs. **Décoder** signifie reconstruire du texte à partir des IDs. Si une étape normalise ou supprime de l’information, le texte reconstruit peut différer de l’original.
 
+## 4. BPE : faire les fusions à la main
 
-**Exemple simple.** Si `l` + `e` apparaît souvent, `le` peut devenir une unité.
+**BPE**, pour *Byte Pair Encoding*, apprend une suite de fusions de paires adjacentes fréquentes. Commençons avec un exemple volontairement simplifié : on découpe chaque mot en caractères, et on interdit les fusions entre mots.
 
-### Byte-level
-
-**Définition concrète.** Une représentation qui peut retomber sur des octets pour les caractères rares.
-
-
-**Exemple simple.** Un symbole rare reste encodable même sans token dédié.
-
-### Fertility
-
-**Définition concrète.** Nombre moyen de tokens nécessaires par mot ou unité de texte.
-
-
-**Exemple simple.** 100 mots représentés par 135 tokens donnent 1,35 token/mot.
-
-### Token spécial
-
-**Définition concrète.** Token réservé à une fonction structurelle.
-
-
-**Exemple simple.** BOS, EOS, PAD, ou marqueurs de rôles de chat.
-
-## Intuition simple
-
-Imagine un jeu de pièces. Une pièce par mot rendrait le vocabulaire gigantesque; une pièce par caractère rendrait les séquences très longues. Les sous-mots sont un compromis : les fragments fréquents deviennent des pièces compactes, les mots rares restent assemblables.
-
-## Ce qui se passe réellement sous le capot
-
-1. Le texte peut être normalisé selon les règles du tokenizer.
-2. Une pré-tokenisation peut repérer des frontières grossières.
-3. L’algorithme applique son vocabulaire et ses règles de segmentation/fusion.
-4. Chaque token est remplacé par son ID.
-5. Des tokens spéciaux peuvent être ajoutés.
-6. Le modèle reçoit finalement une matrice d’entiers `[batch, sequence]`.
-
-## Exemple minimal à comprendre mentalement
-
-Corpus jouet :
+Corpus :
 
 ```text
 bas bas basse
@@ -87,96 +78,239 @@ bas bas basse
 Au départ :
 
 ```text
-b a s
-b a s
-b a s s e
+b a s | b a s | b a s s e
 ```
 
-La paire `b a` est fréquente et peut devenir `ba`, puis `ba s` peut devenir `bas`. Le mot fréquent `bas` coûte alors un token tandis que `basse` peut rester `bas` + `s` + `e`. BPE donne donc des unités plus compactes aux séquences fréquentes.
+La paire `b a` apparaît trois fois. La paire `a s` aussi : il y a une égalité. Supposons que notre règle de départage choisisse `b a`.
 
-## Formules et notation utiles
+| Étape | Représentation | Nombre total d’unités |
+| --- | --- | --- |
+| Départ | `b a s` / `b a s` / `b a s s e` | 11 |
+| Fusion `b` + `a` | `ba s` / `ba s` / `ba s s e` | 8 |
+| Fusion `ba` + `s` | `bas` / `bas` / `bas s e` | 5 |
 
-Mesures simples :
+La paire `ba s` apparaît trois fois après la première fusion : elle peut être fusionnée à son tour.
+
+L’ordre des fusions fait partie du tokenizer appris. À l’encodage d’un nouveau texte, un tokenizer BPE utilise ses règles déjà apprises ; il ne réapprend pas les fréquences à chaque phrase.
+
+> **À toi.** Après ces deux fusions, combien d’unités faut-il pour `basse` ?
+>
+> Trois : `bas`, `s`, `e`. Ce découpage vient de notre règle simplifiée, pas d’une affirmation sur un tokenizer réel.
+
+### Laboratoire A — Reproduire ces fusions
+
+Ce bloc est autonome et utilise seulement Python. Il applique les deux règles choisies ; il ne cherche pas automatiquement les meilleures paires et ne constitue pas un tokenizer BPE complet.
+
+```python
+words = [list(word) for word in "bas bas basse".split()]
+
+
+def merge_pair(symbols, pair):
+    result = []
+    index = 0
+    while index < len(symbols):
+        if index + 1 < len(symbols) and (symbols[index], symbols[index + 1]) == pair:
+            result.append(symbols[index] + symbols[index + 1])
+            index += 2
+        else:
+            result.append(symbols[index])
+            index += 1
+    return result
+
+
+print("Départ :", words, "unités :", sum(len(word) for word in words))
+for pair in [("b", "a"), ("ba", "s")]:
+    words = [merge_pair(word, pair) for word in words]
+    print("Fusion :", pair, "résultat :", words,
+          "unités :", sum(len(word) for word in words))
+```
+
+Tu dois retrouver **11 → 8 → 5 unités**. Modifie le corpus et prédis le résultat avec les mêmes règles : elles ne changent pas automatiquement lorsque le texte change.
+
+## 5. Byte-level, byte fallback et Unigram
+
+Ces termes décrivent des choix qu’il faut distinguer :
+
+- **Byte-level** : travailler sur une représentation fondée sur les octets, avec des fusions possibles. Une base couvrant les 256 valeurs d’octets permet de représenter les chaînes UTF-8 sans réserver un token par caractère Unicode.
+- **Byte fallback** : retomber sur des unités d’octets lorsqu’un fragment ne dispose pas d’une représentation ordinaire adaptée.
+- **Unigram** : une autre famille de segmentation, qui attribue des scores à des unités candidates et recherche une segmentation selon ces scores. Son apprentissage ne se décrit pas comme la suite de fusions BPE ci-dessus.
+
+Un tokenizer byte-level peut avoir bien plus de 256 tokens grâce aux fusions. Des tokens d’octets isolés ne sont pas nécessairement des caractères Unicode complets ; les décoder séparément peut afficher un caractère de remplacement.
+
+À ce stade, retiens surtout qu’un choix d’algorithme et un vocabulaire appris déterminent les unités. Le [module 38](38_entrainer_un_tokenizer_bpe.md) abordera l’entraînement d’un tokenizer.
+
+## 6. Tokenizer et modèle doivent rester compatibles
+
+L’ID 42 d’un tokenizer n’a pas nécessairement le même contenu que l’ID 42 d’un autre. Le modèle a appris à exploiter les lignes d’embedding correspondant à **son** tokenizer.
+
+Changer de tokenizer tout en gardant le même modèle peut donc lui fournir des IDs de sens différent, même si le programme accepte les dimensions.
+
+Ajouter un token ne lui apprend pas automatiquement sa signification. Selon l’opération, il faut aussi adapter les embeddings et la sortie du réseau, puis entraîner les paramètres concernés.
+
+Le **vocabulaire du tokenizer** décrit ce qu’il peut encoder directement. Les **connaissances du modèle** dépendent de ses paramètres appris. Un terme absent comme token unique peut malgré tout être représenté et utilisé via plusieurs tokens.
+
+## 7. Mesurer la fragmentation
+
+Pour un échantillon donné :
 
 \[
-\text{tokens/mot}=\frac{N_{tokens}}{N_{mots}}
+\text{tokens par mot} = \frac{N_{tokens}}{N_{mots}}
+\qquad
+\text{tokens par caractère} = \frac{N_{tokens}}{N_{caractères}}
 \]
 
-\[
-\text{tokens/caractère}=\frac{N_{tokens}}{N_{caractères}}
-\]
+Le premier ratio est parfois appelé **fertility**. Il faut préciser comment on compte les mots et si les tokens spéciaux sont inclus.
 
-Un ratio élevé signifie que la même information consomme davantage de positions de contexte.
+Exemple : 100 mots selon une convention, encodés en 135 tokens ordinaires, donnent `1.35 token par mot`.
 
-## Code minimal observable
+Si le même texte prend 200 tokens avec un autre tokenizer, il utilise davantage de positions. Cela ne prouve pas à lui seul que le deuxième modèle est moins bon : la qualité du réseau, ses données et sa tâche comptent aussi.
+
+Comparer deux langues avec des mots comptés uniquement par espaces peut être trompeur, notamment pour les langues qui n’utilisent pas ces séparateurs de la même façon. Nos ratios seront des mesures locales, pas un classement universel des langues.
+
+## 8. Laboratoire B — Inspecter un tokenizer réel
+
+Ce bloc est autonome. Il nécessite Transformers ; si besoin, `python -m pip install transformers`. Le premier lancement peut télécharger les fichiers du tokenizer Qwen3. Il ne charge pas les poids du modèle.
+
+Prédis si un identifiant technique, un emoji et un mot courant seront segmentés de la même manière. Observe ensuite sans supposer les IDs à l’avance.
 
 ```python
 from transformers import AutoTokenizer
 
-tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
-samples = ["chat", "anticonstitutionnellement", "cybersécurité", "cybersecurity", "CVE-2026-12345"]
+tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
+samples = [
+    "chat", " chat", "Chat", "café", "🙂",
+    "anticonstitutionnellement", "cybersécurité", "cybersecurity",
+    "CVE-2026-12345", "Le chat dort sur le canapé.",
+]
 
 for text in samples:
-    ids = tok.encode(text, add_special_tokens=False)
-    print("\nTEXT  :", text)
-    print("TOKENS:", tok.convert_ids_to_tokens(ids))
-    print("IDS   :", ids)
-    print("COUNT :", len(ids))
-    print("DECODE:", tok.decode(ids))
+    ids = tokenizer.encode(text, add_special_tokens=False)
+    # split() est notre convention simple de comptage, pas une analyse linguistique.
+    word_count = len(text.split())
+    print("\nTexte :", repr(text))
+    print("Unités internes :", tokenizer.convert_ids_to_tokens(ids))
+    print("IDs :", ids)
+    print("Tokens :", len(ids), "caractères :", len(text),
+          "octets UTF-8 :", len(text.encode("utf-8")))
+    print("Tokens/mot :", round(len(ids) / word_count, 3) if word_count else None)
+    decoded = tokenizer.decode(
+        ids, skip_special_tokens=False, clean_up_tokenization_spaces=False,
+    )
+    print("Décodé :", repr(decoded), "identique :", decoded == text)
+
+print("\nTokens spéciaux :", tokenizer.special_tokens_map)
+print("Nombre d’entrées avec tokens ajoutés :", len(tokenizer))
 ```
 
-## Laboratoire guidé
+### Lire les observations
 
-1. Exécute le script.  
-2. Ajoute dix termes de ton domaine et leurs équivalents anglais.  
-3. Calcule tokens/mot sur deux paragraphes comparables.  
-4. Vérifie `decode(encode(texte))`.  
-5. Inspecte `tok.special_tokens_map`.  
-6. Cherche les cinq chaînes les plus fragmentées de ton petit corpus.
+`repr()` rend les espaces et caractères échappés plus visibles. Les chaînes renvoyées par `convert_ids_to_tokens()` peuvent utiliser une notation interne pour les espaces ou les octets : elles ne sont pas toujours des fragments directement lisibles.
 
-## Ce que tu dois observer
+Compare `chat`, ` chat` et `Chat`. Le nombre de tokens peut rester identique alors que les IDs changent. Il peut aussi changer : les frontières et les fréquences apprises comptent.
 
-- Les frontières de tokens ne suivent pas toujours les espaces.
-- Un mot long peut être peu coûteux s’il est fréquent.
-- Les nombres, identifiants et termes techniques peuvent être fortement fragmentés.
-- La même idée exprimée dans deux langues peut consommer un nombre de tokens différent.
+Le décodage de la **liste complète** est plus pertinent que la concaténation de décodages isolés, notamment quand plusieurs tokens correspondent ensemble à un caractère UTF-8.
 
-## À ne pas confondre
+## 9. Expériences guidées
 
-- Token ≠ mot.
-- Token ID ≠ embedding.
-- Vocabulaire du tokenizer ≠ connaissances du modèle.
-- Ajouter un token au vocabulaire ≠ apprendre sa signification.
+Pour chaque expérience, note le texte exact, le tokenizer, les IDs et le nombre de tokens.
 
-## Erreurs fréquentes
+### A — Examiner les espaces
 
-- Comparer uniquement la taille de contexte annoncée entre deux modèles sans comparer leurs tokenizers.
-- Modifier le vocabulaire sans adapter les embeddings du modèle.
-- Croire qu’un tokenizer comprend le sens : il segmente et mappe vers des IDs.
+Compare `"chat"`, `" chat"`, `"chat "` et `"chat\n"`. Prédis ce qui sera visible avec `repr()`, puis examine les unités et le décodage. Un espace n’est pas une décoration gratuite : il peut changer la séquence d’entrée.
 
-## Exercices
+### B — Examiner ton domaine
 
-1. Explique pourquoi 256 tokens d’octets peuvent représenter tout texte mais seraient souvent inefficaces.
-2. Trouve un mot fortement fragmenté et explique pourquoi cela peut coûter cher.
-3. Calcule la fertility d’un échantillon de 50 phrases.
+Ajoute dix termes de ton domaine, avec nombres, noms composés ou code. Trie-les par nombre de tokens. Ne conclus pas qu’un mot très fragmenté est incompréhensible pour le réseau ; constate seulement son coût en positions.
 
-## Validation — avant de continuer
+### C — Comparer deux paragraphes
 
-Tu dois pouvoir, sans simplement réciter le code :
+Choisis deux paragraphes comparables en français et en anglais, puis calcule tokens/mot et tokens/caractère. Indique ta convention de comptage et les limites de cette comparaison.
 
-- Définir token, token ID, vocabulaire, sous-mot et token spécial.
-- Expliquer BPE avec un exemple de fusion simple.
-- Expliquer pourquoi le tokenizer affecte coût et contexte.
-- Lire une sortie tokens/IDs et repérer une forte fragmentation.
+### D — Observer les tokens spéciaux
+
+Compare un encodage avec `add_special_tokens=False` et un avec `True`. Certains tokenizers n’ajoutent rien dans cet appel : c’est un résultat possible. Compare ensuite avec un texte construit par `apply_chat_template` comme au module 1 ; le format conversationnel est une autre étape.
+
+## 10. Exercices avec corrigés
+
+### Exercice 1 — Compter les unités
+
+Pourquoi `len("café")` et `len("café".encode("utf-8"))` ne valent-ils pas la même chose ? Lequel donne le nombre de tokens ?
+
+<details>
+<summary>Corrigé</summary>
+
+Dans cette écriture, le premier compte 4 points de code et le second 5 octets UTF-8. Aucun ne donne le nombre de tokens : il faut utiliser le tokenizer choisi et compter les IDs produits.
+
+</details>
+
+### Exercice 2 — Refaire BPE
+
+Avec nos deux règles `b+a → ba`, puis `ba+s → bas`, comment représenter `bas` et `basse` ? Le tokenizer réapprend-il ses règles pour chaque mot ?
+
+<details>
+<summary>Corrigé</summary>
+
+`bas` devient `["bas"]` et `basse` devient `["bas", "s", "e"]`. Les règles sont appliquées telles quelles ; les apprendre à partir d’un corpus est une autre opération.
+
+</details>
+
+### Exercice 3 — Calculer la fertility
+
+Un texte contient 80 mots selon `split()` et produit 120 tokens hors marqueurs spéciaux. Quel ratio obtiens-tu ? Que faut-il préciser dans un rapport ?
+
+<details>
+<summary>Corrigé</summary>
+
+`120 / 80 = 1.5 token par mot`. Il faut préciser le tokenizer et sa version ou révision, le texte ou corpus, la convention `split()` et l’exclusion des marqueurs spéciaux.
+
+</details>
+
+### Exercice 4 — Comprendre un ajout de token
+
+Tu ajoutes un token unique pour le nom d’une entreprise. Le modèle connaît-il immédiatement son activité ?
+
+<details>
+<summary>Corrigé</summary>
+
+Non. Créer une unité et son ID ne fournit pas ses connaissances au réseau. Les paramètres associés doivent être compatibles et apprendre à exploiter cette unité. Le nom pouvait déjà être représenté par plusieurs sous-tokens auparavant.
+
+</details>
+
+### Exercice 5 — Expliquer un budget
+
+Deux tokenizers encodent le même document en 900 et 1 200 tokens. Dans une fenêtre de 1 024 positions, que peux-tu conclure avant d’ajouter les marqueurs et une réponse ?
+
+<details>
+<summary>Corrigé</summary>
+
+La première représentation laisse théoriquement 124 positions ; la seconde dépasse déjà la fenêtre de 176 positions. Il faut encore compter les marqueurs et la sortie prévue. Cela ne compare pas, à lui seul, la qualité des deux modèles.
+
+</details>
+
+## 11. Validation — avant de continuer
+
+- [ ] Je distingue mot, caractère, octet, token et ID.
+- [ ] Je peux refaire les deux fusions et retrouver `11 → 8 → 5`.
+- [ ] Je sais qu’un tokenizer déjà appris ne réapprend pas pendant chaque encodage.
+- [ ] Je peux expliquer le rôle possible de la normalisation et des marqueurs spéciaux.
+- [ ] Je sais inspecter les IDs et décoder une liste complète.
+- [ ] Je peux calculer un ratio de fragmentation en indiquant ses limites.
+- [ ] Je peux expliquer pourquoi remplacer le tokenizer n’est pas une modification anodine.
 
 ## Fiche mémo
 
-`texte → segmentation → tokens → IDs`. Le tokenizer est l’interface discrète entre le texte et le réseau de neurones.
+```text
+Texte → normalisation éventuelle → pré-tokenisation
+→ segmentation → tokens/IDs → marqueurs éventuels
 
-## Lien avec le module suivant
+BPE : apprendre puis appliquer des règles de fusion.
+Encoder : texte vers IDs ; décoder : IDs vers texte.
+Nombre de tokens : à mesurer avec le tokenizer réellement utilisé.
+```
 
-Le module 3 utilise ces tokens pour comprendre les séquences : padding, truncation, masques et fenêtre de contexte.
+Le [module 3](03_fenetre_de_contexte_et_sequences.md) utilisera ces IDs pour préparer des séquences, du padding et des masques.
 
----
+## Références
 
-> **Règle de progression :** si un point de la validation n’est pas clair, refais le micro-exemple et le laboratoire. Le but est de construire un modèle mental solide, pas d’accumuler des commandes.
+- [Hugging Face Tokenizers : pipeline](https://huggingface.co/docs/tokenizers/en/pipeline) — normalisation, pré-tokenisation, segmentation et post-traitement.
+- [Hugging Face : résumé des tokenizers](https://huggingface.co/docs/transformers/en/tokenizer_summary) — familles de tokenisation, dont BPE et Unigram.

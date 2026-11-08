@@ -1,160 +1,185 @@
-# Module 40 — Concevoir un petit Transformer
+# Module 40 — Dimensionner un petit Transformer cohérent
 
-## Pourquoi ce module arrive ici
+## 1. Ce que tu vas apprendre
 
-Le tokenizer donne `vocab_size`; il faut maintenant choisir hidden size, nombre de couches, heads, MLP et contexte. Ces dimensions déterminent paramètres, mémoire et capacité.
+La taille du vocabulaire ne suffit pas à définir le réseau. Largeur, profondeur, têtes, MLP, contexte et partage des poids déterminent ensemble ses formes et son coût.
 
-## Objectifs
+Tu vas calculer les paramètres d’une petite architecture GPT-2, vérifier ce calcul par PyTorch et tester un forward.
 
-Comprendre les hyperparamètres architecturaux principaux et leurs contraintes de formes. Construire plusieurs configs, compter les paramètres et choisir un petit modèle cohérent.
+**Prérequis :** modules 4, 5 et 37 à 39.
 
-**Prérequis :** Les modules précédents.  
-**Temps indicatif :** 45 à 90 minutes, laboratoire compris.  
-**Niveau :** Pré-entraînement — architecture
+**Temps indicatif :** 90 à 150 minutes.
 
-## Définitions concrètes
+**Matériel :** PyTorch et Transformers, CPU, sans poids préentraînés.
 
-### Hidden size H
+## 2. Nommer les dimensions sans collision
 
-**Définition concrète.** Dimension principale des hidden states.
+| Symbole | Sens |
+| --- | --- |
+| V | Nombre d’IDs de vocabulaire |
+| H | Largeur des hidden states |
+| D | Nombre de blocs |
+| P | Nombre de positions apprises pour ce GPT-2 |
+| h | Nombre de têtes dans cette attention standard |
+| M | Largeur intermédiaire du MLP |
+| B,T | Batch et longueur de la séquence courante |
 
+Pour ce GPT-2, H doit être divisible par h et la dimension par tête vaut H/h. Ce n’est pas une règle universelle pour toute architecture où `head_dim` peut être explicite et Q/K/V avoir des largeurs différentes.
 
-**Exemple simple.** 384, 512, 768…
+La longueur courante T doit respecter le budget P. H décrit les nombres à chaque position, pas le nombre de tokens visibles.
 
-### Num layers L
-
-**Définition concrète.** Nombre de blocs Transformer empilés.
-
-
-**Exemple simple.** 6 ou 12 pour une petite expérience.
-
-### Attention heads
-
-**Définition concrète.** Nombre de têtes partageant généralement H en sous-dimensions.
-
-
-**Exemple simple.** H=384, 6 heads → 64 dimensions/head.
-
-### Intermediate size
-
-**Définition concrète.** Largeur interne du MLP.
-
-
-**Exemple simple.** Souvent plusieurs fois H selon l’architecture.
-
-### Context length
-
-**Définition concrète.** Longueur maximale de séquence utilisée/configurée.
-
-
-**Exemple simple.** 512 pour une expérience rapide.
-
-### Parameter tying
-
-**Définition concrète.** Partage possible entre embeddings d’entrée et tête de sortie.
-
-
-**Exemple simple.** Réduit les paramètres dans certaines architectures.
-
-## Intuition simple
-
-Hidden size définit la largeur de la “représentation” à chaque position; num layers définit la profondeur de transformation; contexte définit combien de positions interagissent; vocabulaire définit combien d’entrées/sorties discrètes existent.
-
-## Ce qui se passe réellement sous le capot
-
-1. Fixer vocab size depuis le tokenizer.
-2. Choisir une longueur de contexte compatible avec les données et la mémoire.
-3. Choisir H et un nombre de heads compatible avec la dimension/head.
-4. Choisir nombre de blocs.
-5. Choisir largeur du MLP et autres détails de l’architecture.
-6. Instancier le modèle sans poids pré-entraînés.
-7. Compter les paramètres et faire un forward aléatoire.
-8. Réduire la taille si le smoke test est trop lent/OOM.
-
-## Exemple minimal à comprendre mentalement
-
-Config pédagogique :
+## 3. Dessiner le réseau choisi
 
 ```text
-V=16000
-H=384
-layers=6
-heads=6
-context=512
+IDs [B,T]
+→ embedding tokens [V,H] + positions apprises [P,H]
+→ D blocs : attention QKV/O + MLP + normes/résidus
+→ norme finale
+→ projection vocabulaire liée à l’embedding
+→ logits [B,T,V]
 ```
 
-Dimension/head : `384/6=64`. Un embedding seul contient `16000×384=6 144 000` paramètres avant éventuel partage avec la tête.
+Notre GPT-2 utilise des positions apprises, pas RoPE. Son MLP de travail a M=4H et deux couches affines. Une architecture à MLP gated demanderait un autre comptage.
 
-## Formules et notation utiles
+Le **weight tying** partage ici l’embedding et le poids de sortie. Il faut compter les paramètres uniques, pas additionner deux noms qui pointent au même objet.
 
-Attention dense standard a une matrice de scores qui croît approximativement comme `L_seq²` par head pour une séquence. C’est pourquoi doubler la longueur de contexte peut augmenter fortement la mémoire/calcul d’attention, même si le nombre de paramètres du modèle ne change presque pas.
+## 4. Compter un bloc
 
-## Code minimal observable
+Dans cette configuration précise :
+
+| Partie | Poids et biais |
+| --- | --- |
+| QKV et sortie attention | 4H² + 4H |
+| MLP H→4H→H | 8H² + 5H |
+| Deux LayerNorm | 4H |
+| Total par bloc | **12H² + 13H** |
+
+Avec embeddings et norme finale, le total unique est :
+
+\[
+N = VH + PH + D(12H^2+13H) + 2H
+\]
+
+Pour V=320, P=128, H=32 et D=2 : **39 808 paramètres**.
+
+Cette formule correspond à notre GPT-2 avec tête liée, biais et MLP décrits ci-dessus. Ce n’est pas une formule universelle des Transformers.
+
+## 5. Laboratoire autonome — Théorie et mesure
 
 ```python
+import torch
 from transformers import GPT2Config, GPT2LMHeadModel
 
-cfg = GPT2Config(
-    vocab_size=16000,
-    n_positions=512,
-    n_embd=384,
-    n_layer=6,
-    n_head=6,
-)
-model = GPT2LMHeadModel(cfg)
-print(model.config)
-print("params:", sum(p.numel() for p in model.parameters()))
+vocab_size = 320
+positions = 128
+measurements = []
+for hidden, depth, heads in [(24, 1, 4), (32, 2, 4), (48, 2, 4)]:
+    assert hidden % heads == 0
+    model = GPT2LMHeadModel(GPT2Config(
+        vocab_size=vocab_size, n_positions=positions, n_embd=hidden,
+        n_layer=depth, n_head=heads, n_inner=4 * hidden,
+        tie_word_embeddings=True, bos_token_id=None, eos_token_id=2, pad_token_id=0,
+        resid_pdrop=0.0, embd_pdrop=0.0, attn_pdrop=0.0, use_cache=False,
+    ))
+    theoretical = vocab_size * hidden + positions * hidden + depth * (12 * hidden**2 + 13 * hidden) + 2 * hidden
+    actual = sum(parameter.numel() for parameter in model.parameters())
+    assert actual == theoretical
+    model.eval()
+    ids = torch.tensor([[4, 5, 6, 7]], dtype=torch.long)
+    with torch.no_grad():
+        logits = model(input_ids=ids).logits
+    shared = model.get_input_embeddings().weight is model.get_output_embeddings().weight
+    print('H=', hidden, 'D=', depth, 'par tete=', hidden // heads,
+          'parametres=', actual, 'theorie=', theoretical,
+          'poids lies=', shared, 'logits=', tuple(logits.shape))
+    measurements.append(actual)
+    del model
 ```
 
-## Laboratoire guidé
+Tu dois retrouver **39 808** pour la deuxième configuration, une égalité théorie/mesure et des logits **[1,4,320]** pour les trois modèles.
 
-1. Crée configs H=256/384/512 à profondeur fixe.  
-2. Crée profondeurs 4/6/12 à H fixe.  
-3. Compte les paramètres.  
-4. Fais un forward sur `[1,128]`, `[1,256]`, `[1,512]` et mesure peak mémoire.  
-5. Choisis une config finale en fonction du temps d’itération, pas seulement du nombre de paramètres.
+Changer seulement le nombre de têtes à H fixe ne multiplie pas automatiquement les poids par ce nombre dans cette architecture : les mêmes dimensions globales sont réparties autrement.
 
-## Ce que tu dois observer
+## 6. Coût du contexte et coût des poids
 
-- Augmenter H augmente plusieurs matrices quadratiquement.
-- Augmenter contexte affecte surtout activations/attention, pas seulement paramètres.
-- Deux modèles au même nombre de paramètres peuvent répartir profondeur/largeur différemment.
+Une attention dense conventionnelle traite des relations entre T positions et peut matérialiser des scores de forme `[B,h,T,T]`. Passer de T à 4T multiplie ce nombre de scores par 16.
 
-## À ne pas confondre
+Des kernels peuvent éviter de stocker toute cette matrice ; ils ne rendent pas tous les calculs indépendants de la longueur. Dans ce GPT-2 à positions apprises, augmenter P augmente aussi la table de positions, même si les autres matrices restent de même taille.
 
-- Context length ≠ hidden size.
-- Heads ≠ layers.
-- Plus de heads ≠ plus de paramètres de façon simple si H reste constant.
+Un modèle qui passe sur T=4 ne valide donc pas sa mémoire sur T=128 avec backward et optimizer.
 
-## Erreurs fréquentes
+## 7. Expériences guidées
 
-- Choisir des heads incompatibles avec H dans une architecture donnée.
-- Dimensionner seulement sur la mémoire des poids.
-- Modifier trop de dimensions avant d’avoir un baseline.
+1. Double V et vérifie l’ajout VH lié à l’embedding. Compare le nombre de tokens d’un même texte avec le tokenizer choisi, pas seulement les poids.
+2. Double D à H fixe, puis H à D fixe. Observe les termes linéaires et quadratiques de la formule.
+3. Compare T=16,32,64 à architecture fixe ; mesure le step complet avec le protocole du module 50.
+4. Désactive le tying dans une copie. Vérifie que la tête indépendante ajoute V×H paramètres pour ce cas sans biais de sortie.
 
-## Exercices
+## 8. Choisir la plus petite expérience informative
 
-1. Calcule dimension/head pour H=768, heads=12.
-2. Calcule paramètres embedding V=32k,H=768.
-3. Explique pourquoi contexte 4× plus long peut coûter beaucoup plus que 4× pour l’attention dense.
+Fixe d’abord ce que tu dois observer : boucle correcte, reprise, effet du corpus ou comparaison architecturale. Un grand modèle qui rend chaque essai lent n’est pas forcément un meilleur outil d’apprentissage.
 
-## Validation — avant de continuer
+Conserve config complète, tokenizer/révision, nombre réel de paramètres, contexte de travail, précision et résultat du smoke test. Un nom comme « tiny » ne remplace aucun de ces nombres.
 
-Tu dois pouvoir, sans simplement réciter le code :
+## 9. Exercices avec corrigés
 
-- Définir H/layers/heads/intermediate/context.
-- Instancier un modèle from config.
-- Compter les paramètres.
-- Justifier une petite architecture selon ton hardware.
+### Exercice 1 — Dimension d’une tête
+
+H=768, h=12 dans une attention standard partageant H : quelle dimension ?
+
+<details>
+<summary>Corrigé</summary>
+
+**64**. Cette division s’applique au design précisé, pas automatiquement à toutes les architectures.
+
+</details>
+
+### Exercice 2 — Embedding
+
+V=32 000 et H=768 : combien de valeurs d’entrée ?
+
+<details>
+<summary>Corrigé</summary>
+
+**24 576 000** valeurs. La sortie peut être liée ou ajouter ses propres paramètres.
+
+</details>
+
+### Exercice 3 — Contexte
+
+Pourquoi T multiplié par quatre peut-il coûter plus que quatre fois pour l’attention dense ?
+
+<details>
+<summary>Corrigé</summary>
+
+Le nombre de relations entre positions est proportionnel à T², donc multiplié par 16. La mémoire réellement matérialisée dépend aussi des kernels.
+
+</details>
+
+### Exercice 4 — Formule exacte
+
+Peut-on réutiliser 12H²+13H pour un bloc avec RMSNorm et MLP gated sans vérifier ?
+
+<details>
+<summary>Corrigé</summary>
+
+Non. Le nombre de projections, leurs dimensions, les biais et les normes changent le compte. La formule est liée aux composants de notre GPT-2.
+
+</details>
+
+## 10. Validation — avant de continuer
+
+- [ ] Je distingue V,H,D,P,h,M et B,T.
+- [ ] Je retrouve le compte de la configuration à 39 808 paramètres.
+- [ ] Je sais quelles hypothèses rendent la formule exacte.
+- [ ] Je teste un forward et le partage de poids.
+- [ ] Je distingue poids, relations d’attention et mémoire du step complet.
 
 ## Fiche mémo
 
-Architecture = compromis entre **largeur, profondeur, contexte, vocabulaire et compute**.
+```text
+Choisir les composants → dessiner les formes → compter → instancier → mesurer.
+Une architecture est un ensemble d’hypothèses, pas une seule taille annoncée.
+```
 
-## Lien avec le module suivant
-
-Le module 41 étudie l’état initial des poids et les premiers signaux de stabilité.
-
----
-
-> **Règle de progression :** si un point de la validation n’est pas clair, refais le micro-exemple et le laboratoire. Le but est de construire un modèle mental solide, pas d’accumuler des commandes.
+Le [module 41](41_initialisation_aleatoire_et_stabilite.md) examine son état initial.

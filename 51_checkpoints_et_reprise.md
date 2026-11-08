@@ -1,144 +1,203 @@
-# Module 51 — Checkpoints et reprise
+# Module 51 — Tester une vraie reprise, pas seulement un fichier de poids
 
-## Pourquoi ce module arrive ici
+## 1. Ce que tu vas apprendre
 
-Un training long doit survivre à une panne, un redémarrage ou une préemption. Sauvegarder seulement `model.safetensors` ne suffit pas à reprendre exactement la dynamique d’optimisation.
+Un checkpoint utile doit se recharger et permettre de continuer selon un contrat défini. Reprendre les poids seuls ne restaure pas automatiquement les moments AdamW, le LR ou l’ordre des données.
 
-## Objectifs
+Tu vas comparer huit updates continues à quatre updates suivies d’une sauvegarde et d’une reprise de quatre autres, avec dropout et tirage aléatoire des exemples.
 
-Distinguer model checkpoint et training state, savoir quoi sauvegarder pour reprendre, tester une restauration et comprendre checkpoints complets vs sharded/adapters.
+**Prérequis :** modules 7, 22, 42 et 50.
 
-**Prérequis :** Les modules précédents.  
-**Temps indicatif :** 45 à 90 minutes, laboratoire compris.  
-**Niveau :** Fiabilité du training
+**Temps indicatif :** deux séances de 60 à 90 minutes.
 
-## Définitions concrètes
+**Matériel :** PyTorch sur CPU. Le test est autonome et utilise un dossier temporaire.
 
-### Model state
+## 2. Définir le contrat de reprise
 
-**Définition concrète.** Valeurs des paramètres du modèle/adapters.
+| État | Pourquoi |
+| --- | --- |
+| Poids et buffers | Reconstituer la fonction du modèle |
+| Optimizer | Moments, compteurs et groupes |
+| Scheduler | Position du planning de LR |
+| Scaler éventuel | Dynamique de précision mixte |
+| Compteurs | Updates, tokens, epoch et position de données |
+| RNG | Dropout, sampling et autres tirages |
+| Données/sampler | Prochain exemple, shard ou curseur consommé |
+| Config/code/tokenizer | Même calcul et même signification des IDs |
 
+Le pilote n’utilise pas de DataLoader, CUDA ou précision mixte. La sélection d’exemples dépend uniquement du RNG Python, et le dropout du RNG PyTorch CPU. Cela rend son contrat complet et testable dans ce cadre limité.
 
-**Exemple simple.** Poids.
+## 3. Sauvegarder à une frontière explicite
 
-### Optimizer state
+Nous sauvegardons après optimizer et scheduler, entre deux updates. Le prochain step remettra les gradients à zéro : il n’est donc pas nécessaire de sauvegarder une accumulation en cours.
 
-**Définition concrète.** Moments/états internes de l’optimizer.
+Si tu sauvegardes au milieu d’une fenêtre d’accumulation, il faut définir ce qu’il arrive aux gradients partiels et aux micro-batches déjà traités. Attendre une frontière d’update simplifie le contrat.
 
+Une écriture dans un fichier temporaire suivie d’un remplacement dans le même système de fichiers évite de présenter un fichier partiellement écrit comme dernier checkpoint finalisé. Cela ne garantit pas à lui seul la durabilité face à toute panne matérielle.
 
-**Exemple simple.** Nécessaires pour reprendre AdamW de façon cohérente.
-
-### Scheduler state
-
-**Définition concrète.** Position actuelle dans la courbe de learning rate.
-
-
-**Exemple simple.** Reprendre au bon LR.
-
-### RNG state
-
-**Définition concrète.** État des générateurs pseudo-aléatoires.
-
-
-**Exemple simple.** Affecte dropout, sampling, shuffling.
-
-### Global step
-
-**Définition concrète.** Nombre d’updates déjà réalisées.
-
-
-**Exemple simple.** Utilisé pour logging/scheduler/sauvegardes.
-
-### Resume
-
-**Définition concrète.** Reconstruction de l’état de training au point sauvegardé.
-
-
-**Exemple simple.** Plus qu’un simple chargement de poids.
-
-## Intuition simple
-
-Le modèle est la position d’une voiture sur la route. L’optimizer et le scheduler sont sa vitesse, son rapport et son itinéraire. Recharger uniquement la position ne recrée pas le même voyage.
-
-## Ce qui se passe réellement sous le capot
-
-1. À intervalle défini, synchroniser les ranks si nécessaire.
-2. Sauvegarder model/adapters ou shards.
-3. Sauvegarder optimizer et scheduler.
-4. Sauvegarder scaler/mixed precision state si applicable.
-5. Sauvegarder global step/epoch, sampler et RNG selon framework.
-6. Écrire la configuration et version de code.
-7. Tester réellement `resume_from_checkpoint` sur un run court.
-8. Valider que LR/step/loss reprennent de manière cohérente.
-
-## Exemple minimal à comprendre mentalement
-
-Mauvaise reprise : charger les poids du step 10 000 mais redémarrer scheduler comme step 0. Le modèle est au milieu de l’entraînement, mais reçoit un LR correspondant au début. Cela peut changer complètement la trajectoire.
-
-## Formules et notation utiles
-
-La fréquence de sauvegarde est un compromis : si tu sauvegardes toutes les `K` updates, une panne peut faire perdre au maximum environ `K` updates depuis le dernier checkpoint valide, hors corruption/écriture en cours.
-
-## Code minimal observable
+## 4. Laboratoire autonome — Continu contre interrompu/repris
 
 ```python
-# Avec Trainer/TRL, la forme exacte dépend de la version :
-trainer.train(resume_from_checkpoint="outputs/checkpoint-1000")
+from copy import deepcopy
+from pathlib import Path
+from tempfile import TemporaryDirectory
+import random
+import torch
+from torch import nn
 
-# Toujours tester la reprise sur un run court avant une expérience coûteuse.
+x = torch.tensor([[1.,0.], [0.,1.], [1.,1.], [2.,1.]])
+y = x.sum(dim=-1, keepdim=True)
+
+
+def create():
+    model = nn.Sequential(nn.Linear(2, 8), nn.Tanh(), nn.Dropout(0.2), nn.Linear(8, 1))
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=4, gamma=0.5)
+    return model, optimizer, scheduler
+
+
+def update(model, optimizer, scheduler):
+    index = random.randrange(len(x))
+    model.train()
+    optimizer.zero_grad(set_to_none=True)
+    loss = nn.functional.mse_loss(model(x[index:index+1]), y[index:index+1])
+    loss.backward()
+    optimizer.step()
+    scheduler.step()
+    return index, loss.item()
+
+
+torch.manual_seed(42)
+random.seed(42)
+model, optimizer, scheduler = create()
+continuous_trace = []
+with TemporaryDirectory(prefix='module51-') as directory:
+    checkpoint = Path(directory) / 'checkpoint.pt'
+    for step in range(1, 9):
+        continuous_trace.append(update(model, optimizer, scheduler))
+        if step == 4:
+            temporary = checkpoint.with_suffix('.tmp')
+            torch.save({'model': model.state_dict(), 'optimizer': optimizer.state_dict(),
+                        'scheduler': scheduler.state_dict(), 'step': step,
+                        'torch_rng': torch.get_rng_state(), 'python_rng': random.getstate()}, temporary)
+            temporary.replace(checkpoint)
+    final_state = deepcopy(model.state_dict())
+    final_lr = optimizer.param_groups[0]['lr']
+
+    restored_model, restored_optimizer, restored_scheduler = create()
+    state = torch.load(checkpoint, weights_only=True, map_location='cpu')
+    restored_model.load_state_dict(state['model'])
+    restored_optimizer.load_state_dict(state['optimizer'])
+    restored_scheduler.load_state_dict(state['scheduler'])
+    # Restaurer les RNG APRES les constructions qui ont pu les consommer.
+    torch.set_rng_state(state['torch_rng'])
+    random.setstate(state['python_rng'])
+    resumed_trace = []
+    for step in range(state['step'] + 1, 9):
+        resumed_trace.append(update(restored_model, restored_optimizer, restored_scheduler))
+
+    same_weights = all(torch.equal(tensor, restored_model.state_dict()[name])
+                       for name, tensor in final_state.items())
+    print('Prochains indices et losses identiques :', continuous_trace[4:] == resumed_trace)
+    print('Poids finaux identiques :', same_weights)
+    print('LR finaux :', final_lr, restored_optimizer.param_groups[0]['lr'])
+    print('Step sauvegarde et fin :', state['step'], step)
 ```
 
-## Laboratoire guidé
+Tu dois obtenir deux comparaisons vraies, un checkpoint au **step 4**, une fin au **step 8** et le même LR final. Le test montre une identité dans cette expérience CPU contrôlée, pas une promesse bit à bit entre tous les matériels et bibliothèques.
 
-1. Lance 100 steps et sauvegarde au step 50.  
-2. Note LR/loss/global step au checkpoint.  
-3. Arrête volontairement le run.  
-4. Reprends depuis le checkpoint.  
-5. Vérifie global step et LR.  
-6. Teste aussi le chargement “weights only” pour comprendre la différence.  
-7. Pour FSDP, documente la procédure exacte de restauration des shards.
+## 5. Pourquoi restaurer les RNG après construction ?
 
-## Ce que tu dois observer
+Créer les nouvelles couches consomme des nombres aléatoires. Si tu restaures le RNG puis construis le modèle, tu changes le point à partir duquel le prochain dropout tirera ses masques.
 
-- Une reprise peut être fonctionnelle sans être bitwise identique selon stack/hardware.
-- Les adapters ont des checkpoints différents des full models.
-- Tester restore est aussi important que tester save.
+De même, un DataLoader avec son propre générateur, des workers ou une source streaming nécessite leurs états ou une procédure de repositionnement. Conserver seulement `seed=42` ne signifie pas reprendre au tirage 10 001 d’un run interrompu.
 
-## À ne pas confondre
+## 6. Poids seuls : utile, mais autre expérience
 
-- Model checkpoint ≠ full training state.
-- Save model ≠ resume training automatiquement.
-- Sharded checkpoint ≠ fichier incomplet; c’est un format distribué.
+Charger les poids puis créer un optimizer neuf peut servir à une nouvelle phase d’adaptation. Ce n’est pas une reprise exacte de l’ancien training.
 
-## Erreurs fréquentes
+Un dossier final d’inférence doit contenir les poids nécessaires, configuration et tokenizer. Un adapter PEFT nécessite sa base compatible. Un checkpoint distribué peut nécessiter un chargement collectif et les outils de sa génération FSDP.
 
-- Découvrir après une panne que les checkpoints ne se rechargent pas.
-- Sauvegarder sans config/tokenizer.
-- Écraser le dernier checkpoint valide lors d’une écriture interrompue.
+Le format du fichier n’indique pas à lui seul quels états sont présents : inspecte le contenu et teste l’usage visé.
 
-## Exercices
+## 7. Fréquence et rotation
 
-1. Liste les états nécessaires pour reprendre AdamW + scheduler.
-2. Explique weights-only vs resume.
-3. Propose une politique de rotation de checkpoints.
+Sauvegarder toutes les K updates peut faire perdre jusqu’à environ K updates depuis le dernier état valide. Des sauvegardes fréquentes coûtent temps et stockage.
 
-## Validation — avant de continuer
+Garde plusieurs générations d’états valides selon ton besoin : dernier, précédent, meilleur sur validation et jalons utiles. Évite de supprimer le seul checkpoint testé avant d’avoir vérifié le nouveau.
 
-Tu dois pouvoir, sans simplement réciter le code :
+Pour une comparaison scientifique, garde aussi les versions de données et résultats d’évaluation liés à chaque état.
 
-- Sauvegarder et reprendre un petit run.
-- Vérifier step et LR.
-- Expliquer model state vs training state.
-- Documenter les checkpoints distribués/adapters.
+## 8. Expériences guidées
+
+1. Oublie seulement l’état optimizer dans une copie. Compare la trace après reprise, même avec les mêmes poids et RNG.
+2. Oublie seulement le RNG torch. Le dropout peut changer malgré le même ordre d’exemples.
+3. Redémarre le scheduler au step zéro et observe le LR ; explique pourquoi ce n’est plus la même trajectoire.
+4. Sur le pilote 42, définis les états supplémentaires du DataLoader avant de prétendre reprendre au milieu d’une epoch.
+
+## 9. Exercices avec corrigés
+
+### Exercice 1 — Seed et état
+
+Pourquoi réappliquer la seed initiale ne suffit-il pas au milieu du run ?
+
+<details>
+<summary>Corrigé</summary>
+
+La seed redémarre un flux, alors que la reprise doit retrouver sa position après les tirages déjà consommés. L’état du générateur encode cette position.
+
+</details>
+
+### Exercice 2 — Frontière
+
+Pourquoi une sauvegarde entre updates simplifie-t-elle l’accumulation ?
+
+<details>
+<summary>Corrigé</summary>
+
+Il n’y a pas de gradient partiel à restaurer pour une update non terminée. Il faut encore conserver les compteurs et le prochain état des données.
+
+</details>
+
+### Exercice 3 — Fichier créé
+
+Un `torch.save` réussi prouve-t-il une reprise correcte ?
+
+<details>
+<summary>Corrigé</summary>
+
+Non. Il faut recharger, continuer et vérifier les états ou sorties attendus. Un fichier peut manquer d’informations indispensables.
+
+</details>
+
+### Exercice 4 — Nouveau training
+
+Est-il toujours incorrect de reprendre seulement les poids ?
+
+<details>
+<summary>Corrigé</summary>
+
+Non. C’est un choix possible pour commencer une nouvelle phase, à annoncer comme tel. Il ne faut simplement pas l’appeler une reprise exacte de la dynamique précédente.
+
+</details>
+
+## 10. Validation — avant de continuer
+
+- [ ] Je définis un contrat d’état correspondant au pipeline réel.
+- [ ] Je retrouve l’identité de la trace et des poids du pilote.
+- [ ] Je restaure les RNG après les constructions concernées.
+- [ ] Je distingue poids seuls et continuation exacte.
+- [ ] Je teste reprise, rotation et éventuel format distribué.
 
 ## Fiche mémo
 
-Un checkpoint utile est un artefact **restaurable**, pas seulement un fichier créé sans erreur.
+```text
+Un checkpoint est une promesse de restauration à vérifier.
+Poids + optimizer + scheduler + RNG + position des données, selon le contrat réel.
+```
 
-## Lien avec le module suivant
+Le [module 52](52_logging_et_tensorboard.md) relie ces états aux métriques du run.
 
-Le module 52 organise les métriques afin de détecter les problèmes sans ouvrir manuellement des logs texte.
+## Référence
 
----
-
-> **Règle de progression :** si un point de la validation n’est pas clair, refais le micro-exemple et le laboratoire. Le but est de construire un modèle mental solide, pas d’accumuler des commandes.
+[PyTorch : sauvegarde et rechargement](https://docs.pytorch.org/tutorials/beginner/saving_loading_models.html).

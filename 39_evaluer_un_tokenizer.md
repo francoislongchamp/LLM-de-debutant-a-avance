@@ -1,146 +1,191 @@
-# Module 39 — Évaluer un tokenizer
+# Module 39 — Évaluer la fidélité et le coût d’un tokenizer
 
-## Pourquoi ce module arrive ici
+## 1. Ce que tu vas apprendre
 
-Un tokenizer qui s’entraîne sans erreur peut être mauvais : fragmentation excessive, mauvais round-trip, mauvaise couverture linguistique ou vocabulaire gaspillé. Il faut le benchmarker comme un composant à part entière.
+Un tokenizer entraîné sans erreur peut fragmenter excessivement certains domaines ou perdre une information que tu voulais préserver.
 
-## Objectifs
+Tu vas comparer deux budgets sur le même holdout, calculer des métriques par catégorie et examiner les textes les plus coûteux.
 
-Mesurer tokens/mot, tokens/caractère, longueur par domaine/langue, round-trip, special tokens et fréquence d’utilisation du vocabulaire. Comparer plusieurs tokenizers sur un corpus holdout.
+**Prérequis :** modules 2 et 38 ; comptage de tokens et round-trip.
 
-**Prérequis :** Les modules précédents.  
-**Temps indicatif :** 45 à 90 minutes, laboratoire compris.  
-**Niveau :** Pré-entraînement — tokenizer
+**Temps indicatif :** 90 à 150 minutes.
 
-## Définitions concrètes
+**Matériel :** Python et Tokenizers, CPU ; le script entraîne ses propres tokenizers.
 
-### Compression ratio
+## 2. Choisir des unités explicites
 
-**Définition concrète.** Rapport entre longueur du texte et nombre de tokens selon une convention choisie.
+| Mesure | Calcul | Limite |
+| --- | --- | --- |
+| Fertility | tokens / mots selon une convention | Le mot n’est pas défini uniformément entre langues |
+| Bytes/token | octets UTF-8 / tokens | Compression de représentation, pas taille exacte d’un fichier |
+| Longueur médiane/P95 | Distribution des nombres de tokens par texte | Dépend des longueurs et du corpus |
+| Round-trip | decode(encode(texte)) comparé à la règle attendue | Une normalisation voulue change la référence |
+| UNK | Occurrences du marqueur inconnu | Zéro UNK ne garantit pas une bonne segmentation |
+| Utilisation du vocabulaire | IDs distincts observés / vocabulaire | Un token rare n’est pas nécessairement inutile |
 
+Nous excluons les marqueurs ajoutés du nombre de tokens ordinaires. Pour les mots, nous utilisons `split()`, convention simple qui doit rester annoncée.
 
-**Exemple simple.** caractères/token ou bytes/token.
+## 3. Moyenne globale ou par texte ?
 
-### Fertility
+Pour 10 mots donnant 20 tokens et 100 mots donnant 100 tokens :
 
-**Définition concrète.** Tokens moyens par mot/unité.
-
-
-**Exemple simple.** 1.2 vs 2.5 tokens/mot.
-
-### Coverage
-
-**Définition concrète.** Capacité à représenter correctement le texte cible.
-
-
-**Exemple simple.** Byte-level offre une couverture pratique très large.
-
-### Round-trip
-
-**Définition concrète.** Encode puis decode restitue le texte selon la normalisation prévue.
-
-
-**Exemple simple.** Détecte certaines pertes inattendues.
-
-### Vocabulary utilization
-
-**Définition concrète.** Part du vocabulaire réellement observée dans le corpus évalué.
-
-
-**Exemple simple.** Des milliers de tokens jamais utilisés peuvent signaler un mauvais corpus ou simplement être rares; à interpréter.
-
-## Intuition simple
-
-Un tokenizer est un compresseur discret appris. Tu veux qu’il représente efficacement les textes importants sans perdre de caractères, tout en gardant un vocabulaire de taille raisonnable.
-
-## Ce qui se passe réellement sous le capot
-
-1. Préparer un corpus d’évaluation non identique au corpus de training tokenizer.
-2. Encoder chaque document.
-3. Mesurer tokens, caractères/bytes, mots et catégories.
-4. Comparer distributions de longueur, pas seulement moyenne.
-5. Tester chaînes Unicode, code, nombres, identifiants et langues importantes.
-6. Vérifier round-trip selon les règles de normalisation.
-7. Comparer plusieurs tailles de vocabulaire et choisir selon compromis.
-
-## Exemple minimal à comprendre mentalement
-
-Tokenizer A : 1.25 token/mot français, 1.10 anglais.  
-Tokenizer B : 1.55 français, 1.05 anglais.  
-Si ton corpus futur est majoritairement français, A peut offrir davantage de texte utile par fenêtre même si B est légèrement meilleur en anglais.
-
-## Formules et notation utiles
-
-\[
-Fertility=\frac{N_{tokens}}{N_{mots}}
-\]
-
-Percentile 95 de longueur est souvent plus informatif que seulement la moyenne pour dimensionner les séquences.
-
-## Code minimal observable
-
-```python
-def metrics(tok, texts):
-    n_tokens=n_chars=n_words=0
-    for text in texts:
-        n_tokens += len(tok.encode(text).ids)
-        n_chars += len(text)
-        n_words += len(text.split())
-    return {
-        "tokens/word": n_tokens/max(n_words,1),
-        "chars/token": n_chars/max(n_tokens,1),
-    }
+```text
+Ratio corpus : 120/110 ≈ 1.091 token/mot
+Moyenne des deux ratios : (2+1)/2 = 1.5
 ```
 
-## Laboratoire guidé
+Les deux nombres pondèrent différemment les textes. Pour une question de budget de corpus, le ratio des sommes est souvent plus directement interprétable ; annonce ton choix.
 
-1. Constitue un holdout de textes par catégorie.  
-2. Compare au moins deux tailles de vocabulaire.  
-3. Rapporte moyenne, médiane et P95 des longueurs.  
-4. Teste accents, emojis, code, URLs, nombres et termes techniques.  
-5. Liste les 20 textes les plus coûteux en tokens et inspecte-les.
+De même, un P95 sur cinq documents est un indicateur très grossier, parfois égal au maximum. Il ne devient pas robuste parce qu’on lui donne un nom de percentile.
 
-## Ce que tu dois observer
+## 4. Laboratoire autonome — Deux BPE, un holdout catégorisé
 
-- Les moyennes globales masquent les sous-domaines très fragmentés.
-- Un vocab plus grand n’améliore pas uniformément toutes les langues.
-- Un round-trip différent peut être normal si tu as explicitement choisi une normalisation destructive, mais ce choix doit être intentionnel.
+Le corpus d’entraînement n’est pas le holdout. Les quelques chaînes réservées servent à apprendre le protocole, pas à classer scientifiquement toutes les langues.
 
-## À ne pas confondre
+```python
+import math
+import statistics
+from collections import defaultdict
+from tokenizers import Tokenizer
+from tokenizers.models import BPE
+from tokenizers.trainers import BpeTrainer
+from tokenizers.pre_tokenizers import ByteLevel
+from tokenizers.decoders import ByteLevel as ByteDecoder
 
-- Meilleure compression ≠ meilleur modèle automatiquement.
-- Utilisation rare d’un token ≠ token inutile automatiquement.
-- Tokenizer benchmark ≠ LM benchmark.
+train_texts = ['Le chat dort. Le chien mange.',
+               'Un modele traite des tokens. Le modele apprend des regularites.',
+               'Un gradient mesure une variation. Les donnees guident le modele.']
+holdout = [
+    ('fr', 'Le réseau traite un café et un emoji 🙂.'),
+    ('fr', 'Une question différente demande une explication précise.'),
+    ('code', 'def add(x, y):\n    return x + y\n'),
+    ('code', 'https://example.test/a?id=12345'),
+    ('en', 'A different sentence tests the tokenizer.'),
+]
 
-## Erreurs fréquentes
 
-- Choisir le tokenizer seulement sur le corpus d’entraînement.
-- Ignorer P95/max et ne regarder que la moyenne.
-- Évaluer une seule langue alors que le modèle sera multilingue.
+def train_tokenizer(size):
+    tokenizer = Tokenizer(BPE(unk_token='<unk>'))
+    tokenizer.pre_tokenizer = ByteLevel(add_prefix_space=False)
+    tokenizer.decoder = ByteDecoder()
+    tokenizer.train_from_iterator(train_texts, BpeTrainer(
+        vocab_size=size, min_frequency=1, initial_alphabet=ByteLevel.alphabet(),
+        special_tokens=['<pad>', '<eos>', '<unk>'], show_progress=False))
+    return tokenizer
 
-## Exercices
 
-1. Définis trois métriques importantes pour ton corpus.
-2. Explique le compromis vocab large vs paramètres embeddings.
-3. Propose un cas où un tokenizer plus compact n’est pas forcément préférable.
+def report(tokenizer):
+    groups = defaultdict(list)
+    used = set()
+    expensive = []
+    for category, text in holdout:
+        ids = tokenizer.encode(text, add_special_tokens=False).ids
+        assert tokenizer.decode(ids, skip_special_tokens=False) == text
+        used.update(ids)
+        groups[category].append((len(ids), len(text.split()), len(text.encode('utf-8'))))
+        expensive.append((len(ids), category, text))
+    for category, values in groups.items():
+        lengths = sorted(value[0] for value in values)
+        words = sum(value[1] for value in values)
+        total = sum(lengths)
+        p95 = lengths[math.ceil(0.95 * len(lengths)) - 1]  # nearest rank
+        print(category, 'n=', len(values), 'tokens/mot=', total / words,
+              'bytes/token=', sum(value[2] for value in values) / total,
+              'mediane=', statistics.median(lengths), 'P95=', p95)
+    print('IDs observes / vocabulaire :', len(used), '/', tokenizer.get_vocab_size())
+    print('Textes les plus couteux :', sorted(expensive, reverse=True)[:2])
 
-## Validation — avant de continuer
 
-Tu dois pouvoir, sans simplement réciter le code :
+for size in [280, 340]:
+    tokenizer = train_tokenizer(size)
+    print('\nBudget=', size, 'taille reelle=', tokenizer.get_vocab_size())
+    report(tokenizer)
+```
 
-- Mesurer fertility/compression.
-- Comparer par catégories.
-- Tester round-trip/special tokens.
-- Choisir un vocabulaire avec une justification quantitative.
+Les round-trips doivent réussir pour ces chaînes. Les métriques numériques dépendront des merges réellement appris ; observe où le plus grand vocabulaire aide et où il apporte peu.
+
+Le P95 utilise ici la convention *nearest rank*. Dans les catégories à un ou deux exemples, il correspond au maximum. Le code l’affiche pour apprendre le calcul, pas pour prétendre à une estimation précise des queues.
+
+## 5. Interpréter une meilleure compacité
+
+Un tokenizer plus compact peut laisser davantage de texte dans la même fenêtre. Il peut aussi augmenter le coût des embeddings et du LM head.
+
+À architecture égale hors vocabulaire, le meilleur ratio tokens/mot n’est donc pas automatiquement le meilleur compromis temps/mémoire/qualité. À l’inverse, une bonne couverture par octets ne rend pas la fragmentation gratuite.
+
+Une différence de langue peut refléter corpus d’apprentissage, conventions et types de documents. Compare des échantillons représentatifs de l’usage, sans généraliser depuis deux traductions.
+
+## 6. Ne pas choisir sur le test final
+
+Utilise un corpus de développement pour régler normalisation, vocabulaire et pré-tokenisation. Garde un autre échantillon pour l’estimation finale si tu multiplies les choix.
+
+Le tokenizer est un composant appris : ses données et sa sélection font partie du protocole. Après chaque choix, conserve la configuration et les résultats plutôt que de ne garder que le vainqueur.
+
+## 7. Expériences guidées
+
+1. Ajoute nombres, identifiants, caractères combinants, tabulations et plusieurs langues importantes pour ton usage.
+2. Calcule ratio des sommes et moyenne des ratios ; explique les différences de pondération.
+3. Liste les textes les plus longs en tokens, puis inspecte ce qui provoque leur fragmentation.
+4. Compare le surcoût V×H des deux tailles et le gain de positions sur ton corpus réservé.
+
+## 8. Exercices avec corrigés
+
+### Exercice 1 — Ratio
+
+50 mots et 75 tokens hors marqueurs donnent quelle fertility ?
+
+<details>
+<summary>Corrigé</summary>
+
+**1.5 token/mot**, sous la convention de mots retenue. Il faut annoncer tokenizer, corpus et inclusion des marqueurs.
+
+</details>
+
+### Exercice 2 — UNK
+
+Aucun UNK dans un texte signifie-t-il que son encodage est compact ?
+
+<details>
+<summary>Corrigé</summary>
+
+Non. Un alphabet d’octets peut représenter le texte sans UNK tout en produisant de nombreuses unités.
+
+</details>
+
+### Exercice 3 — P95 minuscule
+
+Avec deux longueurs [10,100], que donne le nearest-rank P95 ?
+
+<details>
+<summary>Corrigé</summary>
+
+**100**, car ceil(0.95×2)=2. Cela reste un très petit échantillon, pas une description précise d’une distribution future.
+
+</details>
+
+### Exercice 4 — Choix final
+
+Pourquoi ne pas choisir uniquement la taille qui minimise le nombre de tokens ?
+
+<details>
+<summary>Corrigé</summary>
+
+Elle peut coûter davantage en paramètres et calcul de sortie. Il faut aussi fidélité, couverture, coûts et résultats du modèle dans un protocole compatible.
+
+</details>
+
+## 9. Validation — avant de continuer
+
+- [ ] Je définis unités, marqueurs et convention de percentile.
+- [ ] Je compare les mêmes textes et catégories.
+- [ ] Je vérifie le round-trip selon la normalisation prévue.
+- [ ] Je distingue ratio corpus et moyenne des ratios.
+- [ ] Je prends une décision qui inclut compacité et coût du vocabulaire.
 
 ## Fiche mémo
 
-Évaluer le tokenizer revient à vérifier qu’il offre une représentation **fidèle, efficace et adaptée à la distribution cible**.
+```text
+Évaluer fidélité, fragmentation, queues de longueur et coût V×H.
+Un benchmark de tokenizer n’est pas un benchmark de qualité linguistique du modèle.
+```
 
-## Lien avec le module suivant
-
-Le module 40 dimensionne maintenant le Transformer qui consommera ces token IDs.
-
----
-
-> **Règle de progression :** si un point de la validation n’est pas clair, refais le micro-exemple et le laboratoire. Le but est de construire un modèle mental solide, pas d’accumuler des commandes.
+Le [module 40](40_concevoir_un_petit_transformer.md) dimensionne le réseau qui consommera ces IDs.

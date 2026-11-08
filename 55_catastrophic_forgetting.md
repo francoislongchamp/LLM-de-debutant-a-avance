@@ -1,146 +1,174 @@
-# Module 55 — Catastrophic forgetting
+# Module 55 — Mesurer ce qu’une spécialisation fait perdre
 
-## Pourquoi ce module arrive ici
+## 1. Ce que tu vas apprendre
 
-Un modèle spécialisé peut gagner fortement sur le domaine tout en perdant des capacités générales. Il faut mesurer ce coût explicitement, surtout en full FT ou CPT étroit.
+Une adaptation peut améliorer le domaine tout en dégradant des compétences antérieures. On parle d’**oubli catastrophique** lorsque cette dégradation est importante ; son ampleur se mesure sous un protocole défini.
 
-## Objectifs
+Tu vas distinguer oubli et overfitting, observer un compromis contrôlé et comparer des stratégies de mitigation.
 
-Définir forgetting, distinguer forgetting et overfitting, construire un regression benchmark, mesurer gains/pertes et tester des stratégies de mitigation.
+**Prérequis :** modules 13, 14, 25 et 54.
 
-**Prérequis :** Les modules précédents.  
-**Temps indicatif :** 45 à 90 minutes, laboratoire compris.  
-**Niveau :** Évaluation
+**Temps indicatif :** 90 à 150 minutes.
 
-## Définitions concrètes
+**Matériel :** PyTorch sur CPU pour un modèle à un paramètre.
 
-### Catastrophic forgetting
+## 2. Deux questions différentes
 
-**Définition concrète.** Dégradation de compétences antérieures à la suite d’un nouvel entraînement.
+| Question | Mesure concernée |
+| --- | --- |
+| Le modèle s’adapte-t-il trop à son nouveau train ? | Généralisation au domaine : train/validation |
+| Perd-il un comportement antérieur ? | Benchmark de régression avant/après |
 
+On peut oublier une ancienne tâche sans surapprentissage manifeste du nouveau train. On peut aussi surapprendre le nouveau train sans constater une grande perte sur les capacités générales testées.
 
-**Exemple simple.** Math/general baissent après spécialisation domaine.
+Une baisse de score ne démontre pas que toute une connaissance a disparu dans un sens absolu. Elle montre un comportement dégradé sous les entrées et réglages de la mesure ; template ou décodage peuvent aussi influencer ce comportement.
 
-### Regression benchmark
+## 3. Un compromis impossible à cacher
 
-**Définition concrète.** Jeu stable mesurant les capacités à préserver.
-
-
-**Exemple simple.** Questions générales, format, raisonnement.
-
-### Replay / data mixing
-
-**Définition concrète.** Inclusion de données générales pendant la spécialisation.
-
-
-**Exemple simple.** Mélanger un pourcentage de données générales.
-
-### Regularization toward base
-
-**Définition concrète.** Méthodes limitant la dérive par rapport au modèle initial.
-
-
-**Exemple simple.** PEFT, KL-like constraints dans certains contextes, etc.
-
-### Specialization trade-off
-
-**Définition concrète.** Compromis entre performance domaine et conservation générale.
-
-
-**Exemple simple.** +20 domaine, -2 général peut être acceptable; +20,-30 souvent non.
-
-## Intuition simple
-
-Un étudiant qui étudie exclusivement un micro-sujet pendant longtemps peut devenir très performant sur ce sujet tout en négligeant d’autres compétences. Le training peut faire un compromis similaire dans les poids.
-
-## Ce qui se passe réellement sous le capot
-
-1. Évaluer base sur domaine ET général.
-2. Fine-tuner/CPT.
-3. Réévaluer les mêmes suites.
-4. Calculer delta par catégorie.
-5. Identifier quelles capacités régressent.
-6. Tester mitigation : LR plus faible, moins de steps, PEFT, mixture avec données générales, autre méthode.
-7. Comparer le front gain domaine vs perte générale.
-
-## Exemple minimal à comprendre mentalement
+Notre modèle prédit un seul scalaire w. L’ancienne tâche veut 1 ; la nouvelle veut −1. Une seule valeur constante ne peut satisfaire exactement ces deux objectifs contradictoires.
 
 ```text
-              Base   Après
-Domaine        45      88   +43
-Général        82      75    -7
-Raisonnement   76      60   -16
+Ancienne loss : (w−1)²
+Nouvelle loss : (w+1)²
 ```
 
-Dire seulement “domaine +43” cacherait une perte importante en raisonnement.
+L’entraînement séquentiel pousse d’abord vers 1, puis vers −1. Une bonne nouvelle loss ne dit rien, à elle seule, de l’ancienne.
 
-## Formules et notation utiles
+Le **replay** ajoute des données/termes de l’ancienne tâche pendant la spécialisation. Avec un poids ancien 0.25, l’objectif vaut `0.25(w−1)² + 0.75(w+1)²`, dont le minimum est w=−0.5.
 
-Pour chaque capacité :
+Cela protège partiellement l’ancien objectif au prix d’une nouvelle loss moins basse. Cette miniature rend le compromis exact ; elle n’est pas un modèle de toutes les causes d’oubli dans un LLM.
 
-```text
-delta = score_after - score_before
-```
-
-On peut définir des seuils de régression acceptables **avant** l’expérience afin de ne pas les déplacer opportunément après avoir vu les résultats.
-
-## Code minimal observable
+## 4. Laboratoire autonome — Séquentiel ou mélange
 
 ```python
-before={"domain":45,"general":82,"reasoning":76}
-after={"domain":88,"general":75,"reasoning":60}
-for k in before:
-    print(k, after[k]-before[k])
+import torch
+
+
+def train(start, old_weight, steps=40):
+    w = torch.nn.Parameter(torch.tensor(float(start)))
+    optimizer = torch.optim.SGD([w], lr=0.1)
+    for _ in range(steps):
+        old_loss = (w - 1).square()
+        new_loss = (w + 1).square()
+        loss = old_weight * old_loss + (1 - old_weight) * new_loss
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+    return w.detach().item()
+
+
+def evaluate(w):
+    return {'w': w, 'old_loss': (w - 1)**2, 'new_loss': (w + 1)**2}
+
+
+pretrained = train(start=0.0, old_weight=1.0)
+sequential = train(start=pretrained, old_weight=0.0)
+replay = train(start=pretrained, old_weight=0.25)
+print('Avant specialisation :', evaluate(pretrained))
+print('Nouvelle tache seule :', evaluate(sequential))
+print('Avec melange ancien 25% :', evaluate(replay))
 ```
 
-## Laboratoire guidé
+Le premier état approche **1**. Le séquentiel approche **−1**, avec une ancienne loss proche de **4**. Le mélange approche **−0.5**, avec ancienne loss proche de **2.25** et nouvelle proche de **0.25**.
 
-1. Choisis au moins 2 catégories générales à préserver.  
-2. Fixe un seuil maximal de régression.  
-3. Compare base, LoRA et full FT sur domaine+général.  
-4. Si full FT oublie plus, teste LR/steps réduits ou mélange de données générales.  
-5. Trace un tableau gain domaine / perte générale / coût.
+Nous comparons le même nombre d’updates de spécialisation. Le mélange évalue deux termes par step : ce n’est pas une égalité de nombre d’exemples ou de compute à présenter sans précision.
 
-## Ce que tu dois observer
+## 5. Mesurer un modèle réel
 
-- Forgetting peut apparaître même si validation domaine est excellente.
-- PEFT peut limiter certaines altérations mais ne garantit pas zéro régression.
-- Mélanger des données générales consomme une partie du budget de training et modifie le compromis.
+Avant adaptation, fixe un benchmark domaine et plusieurs catégories à préserver. Garde prompts, contextes, template, décodage et scoring compatibles après adaptation.
 
-## À ne pas confondre
+Rapporte pour chaque capacité : score avant, après, delta, effectifs et coût. Fixe des seuils de perte acceptables avant de voir les résultats.
 
-- Forgetting ≠ overfitting : on peut oublier sans surapprendre le train, et inversement.
-- Régression sur benchmark ≠ preuve que les connaissances ont disparu de façon absolue; elle mesure le comportement sous ce protocole.
+Exemple de décision hypothétique : domaine doit gagner au moins dix points et chaque catégorie générale perdre au plus deux points. Une moyenne générale seule peut masquer la perte d’une catégorie critique.
 
-## Erreurs fréquentes
+## 6. Mitigations à comparer, pas remèdes garantis
 
-- Ne pas avoir de baseline générale.
-- Accepter toute régression après coup parce que le score domaine est élevé.
-- Comparer des méthodes avec des budgets de tokens différents sans le signaler.
+| Intervention | Hypothèse |
+| --- | --- |
+| Moins de steps ou LR adapté | Limiter une adaptation devenue excessive |
+| Replay/mixture | Réexposer des compétences à préserver |
+| PEFT/capacité contrainte | Restreindre certaines modifications |
+| Régularisation vers un état | Limiter un déplacement selon la règle choisie |
+| Meilleures données | Éviter contradictions et spécialisation inutilement étroite |
 
-## Exercices
+LoRA peut aussi produire des régressions. Le replay consomme un budget et peut réduire l’exposition au nouveau domaine. Une pénalité de proximité peut freiner un gain souhaité. Mesure le compromis avec les mêmes critères.
 
-1. Donne un exemple de forgetting sans overfitting évident.
-2. Propose trois mitigations.
-3. Définis un seuil d’acceptation pour un cas hypothétique.
+Si la régression vient d’un mauvais template de rechargement, changer la méthode d’entraînement ne traite pas la cause.
 
-## Validation — avant de continuer
+## 7. Suivre plusieurs checkpoints
 
-Tu dois pouvoir, sans simplement réciter le code :
+Une capacité peut se dégrader avant la meilleure loss domaine. Compare plusieurs points d’adaptation et sélectionne sur validation selon les contraintes fixées.
 
-- Mesurer deltas par catégorie.
-- Distinguer forgetting et overfitting.
-- Tester une mitigation.
-- Décider à partir d’un compromis explicite.
+Garde les poids de base pour revenir à un état connu. Un adapter désactivable facilite certaines comparaisons, mais ne prouve pas que son comportement activé conserve toutes les capacités.
+
+Le test final doit estimer le système sélectionné ; si tu l’utilises continuellement pour corriger les régressions, reconnais son nouveau rôle de développement.
+
+## 8. Expériences guidées
+
+1. Fais varier le poids de replay 0,0.25,0.5,0.75. Prédis le minimum `w=2×old_weight−1` puis vérifie les losses.
+2. Compare plusieurs nombres de steps et trace ancien/nouveau objectif sur le même axe.
+3. Sur un petit modèle réel, compare adaptation légère et full FT avec protocole et tuning annoncés.
+4. Examine cinq régressions brutes : distingue information absente, style, refus, format et erreur factuelle selon l’usage.
+
+## 9. Exercices avec corrigés
+
+### Exercice 1 — Minimum du mélange
+
+Avec old_weight=0.5, quel minimum du modèle scalaire ?
+
+<details>
+<summary>Corrigé</summary>
+
+w=0, avec une loss de 1 sur chaque tâche. La capacité constante ne peut satisfaire simultanément les cibles opposées.
+
+</details>
+
+### Exercice 2 — Oubli ou overfitting ?
+
+Le nouveau domaine généralise bien, mais une ancienne capacité baisse. Est-ce exclu par l’absence d’overfitting ?
+
+<details>
+<summary>Corrigé</summary>
+
+Non. Les deux questions sont différentes : on peut bien généraliser sur le nouveau domaine et régresser sur l’ancien.
+
+</details>
+
+### Exercice 3 — Seuil après coup
+
+Pourquoi définir une perte acceptable seulement après les résultats affaiblit-il la décision ?
+
+<details>
+<summary>Corrigé</summary>
+
+Cela permet de déplacer le critère pour accepter le modèle préféré. Un seuil préalable rend le compromis vérifiable ; toute révision doit être justifiée et versionnée.
+
+</details>
+
+### Exercice 4 — Replay
+
+Une réduction d’oubli par replay est-elle gratuite ?
+
+<details>
+<summary>Corrigé</summary>
+
+Non. Elle change les données exposées, le compute ou la part du budget dédiée au domaine. Il faut rapporter ces coûts et le nouveau compromis.
+
+</details>
+
+## 10. Validation — avant de continuer
+
+- [ ] Je distingue oubli et généralisation au nouveau domaine.
+- [ ] Je retrouve les trois états du modèle scalaire.
+- [ ] Je mesure chaque capacité avec des conventions compatibles.
+- [ ] Je fixe des seuils et rapporte les régressions par catégorie.
+- [ ] Je teste une mitigation avec coût et hypothèse explicites.
 
 ## Fiche mémo
 
-Une spécialisation réussie maximise le gain utile **sous contrainte de régression acceptable**.
+```text
+Gagner sur le domaine sous contrainte de préserver les capacités utiles.
+Une mitigation se juge par le compromis observé, pas par son nom.
+```
 
-## Lien avec le module suivant
-
-Les modules 56 à 62 sont des projets intégrateurs. Ils utilisent les compétences précédentes dans des expériences complètes et reproductibles.
-
----
-
-> **Règle de progression :** si un point de la validation n’est pas clair, refais le micro-exemple et le laboratoire. Le but est de construire un modèle mental solide, pas d’accumuler des commandes.
+Les [projets 56 à 62](56_projet_1_lora_specialise.md) assemblent maintenant ces compétences en expériences reproductibles.

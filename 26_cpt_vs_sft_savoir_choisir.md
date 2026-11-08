@@ -1,147 +1,194 @@
-# Module 26 — CPT vs SFT — savoir choisir
+# Module 26 — Choisir une intervention à partir des erreurs observées
 
-## Pourquoi ce module arrive ici
+## 1. Ce que tu vas apprendre
 
-Beaucoup de projets fine-tunent alors qu’ils ont surtout besoin de RAG, ou font du CPT alors qu’ils veulent simplement un format de réponse. Il faut partir du type de manque observé.
+CPT, SFT, récupération documentaire et apprentissage de préférences répondent à des problèmes différents. Les empiler ne remplace pas un diagnostic.
 
-## Objectifs
+Tu vas écrire des hypothèses testables, distinguer information manquante et mauvais comportement, puis choisir une première expérience avec une mesure qui pourrait réfuter ton idée.
 
-Diagnostiquer un besoin : connaissance externe dynamique, vocabulaire/distribution de domaine, comportement/instruction, préférence. Choisir RAG, CPT, SFT ou combinaison avec une hypothèse testable.
+**Prérequis :** modules 9 à 14 et 25.
 
-**Prérequis :** Les modules précédents.  
-**Temps indicatif :** 45 à 90 minutes, laboratoire compris.  
-**Niveau :** Adaptation de domaine
+**Temps indicatif :** 90 à 150 minutes.
 
-## Définitions concrètes
+**Matériel :** Python pour le tableau d’audit. Aucune récupération externe ni aucun entraînement n’est effectué par le laboratoire.
 
-### Knowledge gap
+## 2. Décrire un échec sans nommer déjà le remède
 
-**Définition concrète.** Information absente ou difficile à produire correctement.
+« Il me faut un LoRA » est une solution supposée. « Sur 20 questions avec la procédure fournie, le modèle ne respecte pas le schéma de réponse dans 8 cas » est une observation.
 
+Commence par conserver : entrée exacte, réponse, réponse attendue ou grille, source du contexte, catégorie d’échec et conditions de génération.
 
-**Exemple simple.** Le modèle ignore une procédure interne récente.
+| Type de problème | Question de diagnostic |
+| --- | --- |
+| Information absente ou récente | L’information utile est-elle fournie et accessible ? |
+| Contexte mal récupéré | Les bons passages sont-ils présents, complets et bien placés ? |
+| Distribution spécialisée | Le modèle interprète-t-il correctement jargon, syntaxe et relations ? |
+| Comportement/format | Réussit-il le fond mais ignore-t-il une consigne stable ? |
+| Préférence | Plusieurs sorties sont-elles valides, mais certaines préférables selon une grille ? |
 
-### Behavior gap
+Une erreur peut avoir plusieurs causes. Un diagnostic est une hypothèse à tester, pas une étiquette produite automatiquement par le modèle.
 
-**Définition concrète.** Le modèle possède l’information mais ne répond pas dans le format/style attendu.
+## 3. Ce que chaque intervention change
 
+| Intervention | Ce qui change principalement | Première mesure utile |
+| --- | --- | --- |
+| Prompt/exemples en contexte | Entrée au moment de l’inférence | Respect des consignes sur prompts réservés |
+| RAG | Documents récupérés et fournis en contexte | Qualité de récupération puis réponse fondée sur ces documents |
+| SFT | Paramètres adaptés à des sorties supervisées | Comportement et exactitude sur nouvelles instructions |
+| CPT | Modélisation de la distribution documentaire | Loss domaine et tâches concrètes de domaine |
+| Préférences/DPO | Ordre relatif entre réponses selon des annotations | Paires réservées et benchmark général |
 
-**Exemple simple.** Il connaît JSON mais ne respecte pas un schéma.
+**RAG**, *Retrieval-Augmented Generation*, ajoute une étape de récupération avant la génération. Les poids peuvent rester identiques. Il faut pourtant évaluer la récupération, le contexte produit et l’utilisation de ce contexte.
 
-### Distribution shift
+Une contrainte de décodage peut aider pour un schéma strict lorsque l’outil la prend en charge. Cela ne rend pas automatiquement correctes les valeurs produites.
 
-**Définition concrète.** Les textes visés diffèrent nettement des données générales.
+## 4. Trois contre-tests utiles
 
+### Test A — Fournir explicitement l’information
 
-**Exemple simple.** Langage spécialisé, syntaxe de code particulière.
+Si le modèle échoue sans la procédure récente mais réussit lorsqu’elle est fournie dans le prompt, une récupération documentaire peut être une première hypothèse utile.
 
-### RAG
+S’il échoue même avec le bon passage, améliorer seulement le moteur de recherche ne suffit probablement pas. Vérifie instruction, lisibilité, longueur, conflit entre sources et compétence requise.
 
-**Définition concrète.** Récupération de documents au moment de l’inférence pour fournir du contexte.
+### Test B — Donner un exemple de format
 
+Si un exemple en contexte suffit à produire le format attendu, teste cette solution avant un entraînement. Si le besoin reste fréquent et stable, un SFT peut être étudié avec un benchmark de format **et de contenu**.
 
-**Exemple simple.** Information qui change souvent et doit être citée.
+### Test C — Mesurer le domaine sans confondre lecture et réponse
 
-### Post-training
+Une perte élevée sur des documents spécialisés peut motiver une étude CPT. Elle ne démontre pas seule que CPT résoudra des questions de raisonnement ou de restitution factuelle. Ajoute des tâches concrètes et un contrôle des capacités générales.
 
-**Définition concrète.** Étapes après le pré-entraînement de base, incluant SFT, préférence, RL, etc.
+## 5. Laboratoire autonome — Faire l’inventaire des hypothèses
 
-
-**Exemple simple.** Apprendre un comportement ou une préférence.
-
-## Intuition simple
-
-Avant de “traiter” le modèle, diagnostique le symptôme. Si l’information change chaque semaine, l’inscrire dans les poids par training peut être le mauvais outil. Si le problème est un style de réponse, faire lire 100 GB de texte brut peut être disproportionné.
-
-## Ce qui se passe réellement sous le capot
-
-1. Écrire des exemples précis d’échec du modèle de base.
-2. Classer chaque échec : manque d’information, mauvaise utilisation, mauvaise distribution, mauvais comportement, mauvaise préférence.
-3. Tester d’abord l’intervention la moins coûteuse répondant au problème.
-4. Définir une baseline et un benchmark ciblé.
-5. Appliquer une seule intervention principale.
-6. Comparer et n’ajouter une seconde étape que si la mesure justifie sa nécessité.
-
-## Exemple minimal à comprendre mentalement
-
-Cas A : le modèle ne connaît pas les procédures internes mises à jour hier → RAG est souvent plus naturel.  
-Cas B : il lit correctement les procédures mais refuse de produire le format YAML attendu → SFT peut être pertinent.  
-Cas C : il peine sur un jargon et une distribution documentaire très spécialisée malgré contexte suffisant → CPT peut être étudié.  
-Cas D : deux réponses sont valides mais on veut préférer systématiquement la plus claire → préférence/DPO peut être pertinent.
-
-## Formules et notation utiles
-
-Le choix est principalement expérimental, pas une formule. On peut toutefois comparer le **gain par coût** :
-
-\[
-Efficiency=\frac{\Delta score}{coût\;GPU\;ou\;tokens\;d’entraînement}
-\]
-
-C’est une aide à la décision, pas une métrique universelle.
-
-## Code minimal observable
+Les observations suivantes sont fictives. Le programme les regroupe ; il ne découvre pas leur cause et ne lance pas les interventions proposées.
 
 ```python
-decision = {
-  "information_fraiche": "RAG",
-  "comportement_format": "SFT",
-  "distribution_domaine": "CPT à tester",
-  "preference_reponses": "DPO/RL à tester",
-}
-for symptom, method in decision.items():
-    print(symptom, "->", method)
+from collections import Counter
+
+cases = [
+    {'id': 'a', 'evidence': 'Reussit quand la procedure recente est fournie.',
+     'hypothesis': 'information', 'first_test': 'contexte pertinent fourni puis recuperation'},
+    {'id': 'b', 'evidence': 'Bonne valeur mais sortie en prose au lieu de JSON.',
+     'hypothesis': 'format', 'first_test': 'consigne et exemple de schema sur validation'},
+    {'id': 'c', 'evidence': 'Confond encore le jargon avec le glossaire dans le contexte.',
+     'hypothesis': 'domaine', 'first_test': 'diagnostic de lecture puis pilote CPT ou SFT cible'},
+    {'id': 'd', 'evidence': 'Deux reponses correctes ; une est plus claire selon la grille.',
+     'hypothesis': 'preference', 'first_test': 'annotation de paires et accord des relecteurs'},
+    {'id': 'e', 'evidence': 'Le passage recupere concerne une autre version de la procedure.',
+     'hypothesis': 'recuperation', 'first_test': 'mesurer pertinence et version des sources'},
+]
+print('Types observes :', dict(Counter(case['hypothesis'] for case in cases)))
+for case in cases:
+    print(case['id'], '\n preuve :', case['evidence'], '\n premier test :', case['first_test'])
+
+# Exemple de critère de décision fixé avant une expérience fictive.
+required_content = 0.90
+required_format = 0.95
+pilots = [
+    {'name': 'prompt', 'content': 0.91, 'format': 0.92, 'cost_units': 1},
+    {'name': 'sft', 'content': 0.90, 'format': 0.97, 'cost_units': 4},
+    {'name': 'cpt', 'content': 0.93, 'format': 0.88, 'cost_units': 8},
+]
+acceptable = [pilot for pilot in pilots
+              if pilot['content'] >= required_content and pilot['format'] >= required_format]
+print('Acceptables selon ces seuils fictifs :', [pilot['name'] for pilot in acceptable])
 ```
 
-## Laboratoire guidé
+Le tableau doit retenir seulement **sft** selon ces seuils et ces scores **inventés**. Il ne constitue pas une recommandation mesurée pour ton projet.
 
-1. Prends 20 erreurs réelles du modèle de base.  
-2. Classe chacune par type de gap.  
-3. Choisis 5 erreurs représentatives.  
-4. Écris une hypothèse : “si je fais SFT/CPT/RAG, alors telle métrique devrait s’améliorer”.  
-5. Définis le test qui pourrait réfuter ton hypothèse.  
-6. Ne combine pas tout avant d’avoir un résultat isolé.
+Le pilote CPT a ici un meilleur score de contenu mais manque le seuil de format. Le prompt est moins coûteux mais n’atteint pas non plus la contrainte. Cela montre pourquoi il faut définir plusieurs exigences plutôt qu’un seul nombre de gain par coût.
 
-## Ce que tu dois observer
+## 6. Rédiger une hypothèse réfutable
 
-- Plusieurs échecs ont des causes différentes.
-- Le training n’est pas le seul moyen d’ajouter de l’information.
-- Une combinaison CPT→SFT peut être logique, mais seulement si chaque étape répond à un manque identifié.
+Une fiche d’expérience pourrait dire :
 
-## À ne pas confondre
+> Sur des procédures fournies en contexte, un SFT de format devrait faire passer le respect du schéma de 70 % à au moins 95 %, sans réduire l’exactitude de plus de deux points sur la validation fixée.
 
-- RAG ≠ fine-tuning.
-- CPT ≠ “charger des documents dans le modèle” de façon garantie et récupérable.
-- SFT ≠ base de connaissances fiable.
+Elle indique données disponibles, intervention, mesures et seuils. Un résultat qui échoue aux seuils remet l’hypothèse en question, même si quelques sorties sont jolies.
 
-## Erreurs fréquentes
+Les seuils doivent venir de l’usage et de la fiabilité de mesure ; 95 % sur vingt cas reste sensible à un exemple. Conserve les effectifs et les types d’erreurs.
 
-- Choisir une méthode parce qu’elle est populaire.
-- Empiler CPT+SFT+DPO sans baseline intermédiaire.
-- Mesurer seulement la satisfaction subjective.
+## 7. Quand combiner des méthodes ?
 
-## Exercices
+CPT→SFT peut être cohérent si le CPT améliore une modélisation de domaine utile et que le SFT apporte un comportement encore manquant. RAG+SFT peut combiner information actualisable et comportement appris.
 
-1. Pour cinq problèmes fictifs, choisis RAG/CPT/SFT et justifie.
-2. Donne un exemple où CPT+SFT est cohérent.
-3. Donne un exemple où RAG est préférable au training.
+Compare des étapes intermédiaires : base, base+première intervention, puis combinaison. Si tu changes simultanément données, objectif, retrieval et décodage, l’origine du gain devient difficile à attribuer.
 
-## Validation — avant de continuer
+Le coût inclut calcul, annotation, intégration, maintenance et mises à jour. Une information changeant souvent peut rendre coûteux un entraînement répété ; un système de récupération a aussi ses propres coûts et erreurs.
 
-Tu dois pouvoir, sans simplement réciter le code :
+## 8. Projet guidé — Auditer vingt erreurs réelles
 
-- Diagnostiquer le type de gap.
-- Choisir une méthode avec justification.
-- Formuler une hypothèse mesurable.
-- Éviter l’empilement d’étapes sans preuve.
+1. Sélectionne vingt erreurs de la base sans ne garder que les cas favorables à ta méthode préférée.
+2. Note les preuves disponibles et les causes possibles, avec une catégorie « incertain » si nécessaire.
+3. Fais les contre-tests A/B/C sur quelques cas représentatifs.
+4. Choisis une intervention principale et une mesure indépendante.
+5. Écris ce qui réfuterait ton hypothèse.
+6. Mesure une baseline, exécute le pilote et conserve les régressions.
+7. Ajoute une seconde étape seulement si elle répond à un échec restant identifié.
+
+Ton livrable est une décision argumentée, pas obligatoirement un modèle entraîné.
+
+## 9. Exercices avec corrigés
+
+### Exercice 1 — Information récente
+
+Le modèle ignore une procédure modifiée hier et réussit quand le bon passage est fourni. Quel premier test envisager ?
+
+<details>
+<summary>Corrigé</summary>
+
+Tester une récupération du bon passage, sa version et son utilisation dans la réponse. Cela soutient une hypothèse RAG, sans garantir que tout le système réussira.
+
+</details>
+
+### Exercice 2 — Format strict
+
+Le contenu est correct mais le JSON est invalide. CPT est-il une conséquence nécessaire ?
+
+<details>
+<summary>Corrigé</summary>
+
+Non. Tester consigne, exemples, validation ou décodage contraint si disponible, puis SFT de comportement si le besoin et les mesures le justifient. Le texte brut ne montre pas forcément le format attendu.
+
+</details>
+
+### Exercice 3 — Préférences
+
+Deux réponses sont correctes mais l’une est plus claire. Pourquoi la grille d’annotation compte-t-elle ?
+
+<details>
+<summary>Corrigé</summary>
+
+« Plus claire » doit être défini pour produire des paires cohérentes. Sinon les annotations peuvent refléter des goûts contradictoires ou un raccourci comme la longueur.
+
+</details>
+
+### Exercice 4 — Empilement
+
+Tu appliques CPT, SFT et DPO puis le score monte. Peux-tu dire quelle étape a aidé ?
+
+<details>
+<summary>Corrigé</summary>
+
+Pas sans comparaisons intermédiaires et conditions compatibles. Il faut mesurer les contributions et les coûts des étapes, avec leurs régressions éventuelles.
+
+</details>
+
+## 10. Validation — avant de continuer
+
+- [ ] Je décris un échec observable avant de choisir une méthode.
+- [ ] Je distingue absence d’information, récupération, domaine, format et préférence.
+- [ ] Je peux proposer un contre-test avec contexte ou exemple fourni.
+- [ ] J’écris une hypothèse avec critères de réussite et réfutation.
+- [ ] Je distingue les scores fictifs du laboratoire de preuves pour mon projet.
+- [ ] Je sais évaluer une combinaison par étapes.
 
 ## Fiche mémo
 
-La meilleure méthode est celle qui corrige **le problème observé** avec le coût et le risque appropriés.
+```text
+Observer → formuler plusieurs causes → contre-tester → choisir un pilote → mesurer.
+CPT, SFT et RAG ne sont pas des garanties d’information fiable.
+La méthode répond au problème mesuré et aux contraintes d’usage.
+```
 
-## Lien avec le module suivant
-
-Le module 27 change de signal : au lieu d’une réponse cible unique, on apprend à partir de préférences `chosen > rejected`.
-
----
-
-> **Règle de progression :** si un point de la validation n’est pas clair, refais le micro-exemple et le laboratoire. Le but est de construire un modèle mental solide, pas d’accumuler des commandes.
+Le [module 27](27_donnees_de_preference_et_dpo.md) passe des démonstrations uniques aux comparaisons entre réponses.

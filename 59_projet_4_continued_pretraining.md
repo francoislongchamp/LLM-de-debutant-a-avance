@@ -1,149 +1,203 @@
-# Module 59 — Projet 4 — Continued pretraining
+# Module 59 — Projet 4 : isoler la valeur ajoutée d’un CPT
 
-## Pourquoi ce module arrive ici
+## 1. Ce que tu vas construire
 
-Le CPT est facile à justifier verbalement (“le modèle doit apprendre le domaine”) mais difficile à prouver. Ce projet compare directement Base→SFT contre Base→CPT→SFT.
+Le projet compare deux chemins depuis la même base : **base→SFT** et **base→CPT→même SFT**. Il doit distinguer progrès de modélisation documentaire et valeur finale pour la tâche.
 
-## Objectifs
+**Prérequis :** modules 25, 26, 45 à 47, 54 à 56.
 
-Mesurer la valeur ajoutée d’un CPT de domaine avant SFT, en contrôlant le SFT final et en surveillant perplexité domaine, benchmark métier et forgetting général.
+**Temps indicatif :** pilote court sur CPU ; expérience réelle de plusieurs heures ou davantage selon le corpus.
 
-**Prérequis :** Les modules précédents.  
-**Temps indicatif :** 6 à 12 heures pour une expérience pédagogique courte.  
-**Niveau :** Projet intégrateur
+**Matériel :** environnement TRL du module 12. Le pilote nécessite `outputs/module12/final`, créé depuis le même dossier de lancement.
 
-## Définitions concrètes
-
-### Control path
-
-**Définition concrète.** Pipeline sans l’intervention étudiée.
-
-
-**Exemple simple.** Base→SFT.
-
-### Treatment path
-
-**Définition concrète.** Pipeline avec intervention.
-
-
-**Exemple simple.** Base→CPT→SFT.
-
-### Domain holdout
-
-**Définition concrète.** Texte du domaine non utilisé au CPT pour mesurer language modeling.
-
-
-**Exemple simple.** Validation corpus.
-
-### Downstream benchmark
-
-**Définition concrète.** Tâche finale après SFT.
-
-
-**Exemple simple.** Questions domaine.
-
-### Intermediate checkpoint
-
-**Définition concrète.** Modèle après CPT avant SFT.
-
-
-**Exemple simple.** Permet d’isoler ce que CPT change.
-
-## Intuition simple
-
-Le CPT n’est utile au projet que si ses gains survivent et apportent quelque chose **après le même SFT**. Sinon, il ajoute du coût sans bénéfice démontré.
-
-## Ce qui se passe réellement sous le capot
-
-1. Évaluer base sur corpus domaine/général.
-2. Faire CPT court et évaluer intermediate.
-3. Dupliquer le même SFT : une branche depuis base, une depuis CPT.
-4. Utiliser même dataset SFT et protocole.
-5. Comparer les deux modèles finaux.
-6. Mesurer généralisation et forgetting.
-7. Calculer coût supplémentaire du CPT.
-
-## Exemple minimal à comprendre mentalement
+## 2. Dessiner les points de mesure
 
 ```text
-                    Base→SFT   Base→CPT→SFT
-Domain benchmark       72          81
-General                80          78
-CPT extra GPU-hours     0           6
+Base ───────────→ SFT contrôle ───→ évaluation finale contrôle
+  └→ CPT → mesure intermédiaire → même SFT → évaluation finale traitement
 ```
 
-Le projet doit décider si +9 domaine / -2 général / +6h est un bon compromis pour l’objectif.
+Évalue la base, l’état CPT intermédiaire et les deux modèles finaux. Sans l’intermédiaire, une variation finale est plus difficile à relier aux phases.
 
-## Formules et notation utiles
+Le coût du CPT est supplémentaire. Ce protocole mesure sa valeur marginale dans ce pipeline ; il n’est pas une égalité de compute total entre les branches. Une autre expérience à compute total égal poserait une autre question.
 
-Valeur marginale du CPT :
+## 3. Données à préparer
 
-```text
-ΔCPT = score(CPT→SFT) - score(SFT-only)
+Le corpus documentaire CPT et les démonstrations SFT ont des rôles différents. Ils peuvent concerner le même domaine, mais tu dois tracer leurs sources et éviter les fuites vers les évaluations.
+
+Sépare les documents liés avant le blocage de tokens. Garde un holdout de langage de domaine, un benchmark métier et des catégories générales à préserver.
+
+Une baisse de PPL domaine ne prouve ni suivi d’instruction ni restitution fiable des faits. Les résultats de la tâche finale comptent pour décider si le CPT répond à ton besoin.
+
+## 4. Laboratoire guidé — Deux chemins réellement entraînés
+
+Le pilote utilise le petit checkpoint appris du module 12 et des séquences de mots artificielles. Les variantes réservées sont proches et peu nombreuses ; il vérifie le graphe expérimental, pas une spécialisation linguistique robuste.
+
+Les deux SFT ont mêmes données, seed, steps et configuration. Les LR de miniature ne sont pas des recommandations pour un LLM réel.
+
+```python
+import json
+from pathlib import Path
+import time
+import torch
+from datasets import Dataset
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from trl import SFTConfig, SFTTrainer
+
+source = Path('outputs/module12/final')
+if not source.exists():
+    raise FileNotFoundError('Executer le laboratoire 12 depuis le meme dossier.')
+root = Path('outputs/project59')
+root.mkdir(parents=True, exist_ok=True)
+tokenizer = AutoTokenizer.from_pretrained(source, local_files_only=True)
+train = Dataset.from_list([
+    {'prompt': 'question batch signifie reponse ', 'completion': 'groupe exemples <eos>'},
+    {'prompt': 'question gradient signifie reponse ', 'completion': 'derivee loss <eos>'},
+])
+validation = Dataset.from_list([
+    {'prompt': 'question batch quoi signifie reponse ', 'completion': 'groupe exemples <eos>'},
+    {'prompt': 'question gradient quoi signifie reponse ', 'completion': 'derivee loss <eos>'},
+])
+domain_train = tokenizer(['gradient derivee loss <eos>', 'batch groupe exemples <eos>'],
+                         return_tensors='pt', padding=True, add_special_tokens=False)
+domain_validation = tokenizer(['gradient loss derivee <eos>', 'batch exemples groupe <eos>'],
+                              return_tensors='pt', padding=True, add_special_tokens=False)
+
+
+def labels_for(inputs):
+    labels = inputs['input_ids'].clone()
+    labels[inputs['attention_mask'] == 0] = -100
+    return labels
+
+
+def lm_loss(model, inputs):
+    model.eval()
+    with torch.no_grad():
+        return model(**inputs, labels=labels_for(inputs)).loss.item()
+
+
+reports = []
+for name, cpt_steps in [('sft_only', 0), ('cpt_then_sft', 20)]:
+    torch.manual_seed(42)
+    model = AutoModelForCausalLM.from_pretrained(source, local_files_only=True)
+    before = lm_loss(model, domain_validation)
+    start = time.perf_counter()
+    if cpt_steps:
+        optimizer = torch.optim.AdamW(model.parameters(), lr=0.003, weight_decay=0.0)
+        model.train()
+        for _ in range(cpt_steps):
+            optimizer.zero_grad(set_to_none=True)
+            model(**domain_train, labels=labels_for(domain_train)).loss.backward()
+            optimizer.step()
+        del optimizer
+        model.save_pretrained(root / 'intermediate_cpt')
+    cpt_seconds = time.perf_counter() - start
+    after_cpt = lm_loss(model, domain_validation)
+    args = SFTConfig(output_dir=str(root / name), use_cpu=True, bf16=False, fp16=False,
+                     max_steps=20, learning_rate=0.001, per_device_train_batch_size=2,
+                     max_length=64, completion_only_loss=True, packing=False,
+                     gradient_checkpointing=False, report_to='none', save_strategy='no',
+                     logging_steps=20, seed=42, disable_tqdm=True)
+    trainer = SFTTrainer(model=model, processing_class=tokenizer, args=args,
+                         train_dataset=train, eval_dataset=validation)
+    before_sft = trainer.evaluate()['eval_loss']
+    trainer.train()
+    after_sft = trainer.evaluate()['eval_loss']
+    trainer.save_model(str(root / name / 'final'))
+    reports.append({'path': name, 'cpt_steps': cpt_steps, 'cpt_seconds_cpu': cpt_seconds,
+                    'domain_nll_before': before, 'domain_nll_after_cpt': after_cpt,
+                    'completion_nll_before_sft': before_sft, 'completion_nll_after_sft': after_sft,
+                    'sft_steps': 20})
+(root / 'report.json').write_text(json.dumps(reports, indent=2), encoding='utf-8')
+print(reports)
 ```
 
-Mesure aussi ce delta par catégories et non seulement globalement.
+Le rapport doit contenir **deux branches**, avec **0 et 20 steps CPT**, puis **20 steps SFT dans chacune**. L’état intermédiaire est conservé séparément.
 
-## Code minimal observable
+Les gains sont mesurés, pas garantis. Si la completion NLL finale ne s’améliore pas grâce au CPT, le pilote ne démontre pas son intérêt pour cette mesure. Un résultat négatif n’autorise pas à changer le benchmark après coup.
 
-```text
-base
-├── eval_base
-├── sft_control ──> eval_final_control
-└── cpt ──> eval_cpt ──> sft_same_data ──> eval_final_treatment
-```
+`lm_loss` utilise ici un batch documentaire avec une même longueur et des labels PAD masqués. Pour plusieurs batches variables, agrège leurs sommes NLL et leurs effectifs actifs comme au module 44.
 
-## Laboratoire guidé
+## 5. Passer à un corpus réel
 
-1. Prépare corpus CPT et dataset SFT distincts.  
-2. Vérifie contamination entre corpus holdout et train.  
-3. Évalue base.  
-4. Fais CPT et évalue.  
-5. Fais les deux SFT avec config identique adaptée au point de départ.  
-6. Compare finals sur le même test.  
-7. Inspecte aussi des cas où CPT a empiré le comportement.
+1. Fige base, tokenizer, corpus, groupes et rapports de nettoyage.
+2. Définis un budget de tokens CPT, la mixture et les répétitions prévues.
+3. Archive les mesures initiales domaine et générales.
+4. Réalise le CPT avec logs, contrôles de mémoire et reprise testée.
+5. Mesure l’état intermédiaire et les éventuelles régressions.
+6. Applique le même protocole SFT de contrôle et de traitement ; annonce toute adaptation de tuning.
+7. Sélectionne sur validation et évalue les deux finales selon le même test.
+8. Rapporte coût supplémentaire et gain marginal par catégorie.
 
-## Ce que tu dois observer
+Pour séparer effet d’étape et meilleure recette, tu peux prévoir une étude secondaire de tuning comparable. Ne la mélange pas avec l’ablation principale à SFT fixé.
 
-- La baisse de PPL domaine après CPT ne garantit pas un gain downstream.
-- Un SFT fort peut masquer une partie des différences de CPT.
-- CPT étroit peut créer forgetting avant même SFT.
+## 6. Tableau et livrables
 
-## À ne pas confondre
+Conserve pour chaque état : loss/PPL domaine avec protocole, benchmark de tâche, régression générale, tokens exposés, temps, mémoire et identité de checkpoint.
 
-- Gain intermediate ≠ gain final.
-- CPT corpus ≠ SFT dataset.
-- PPL domaine ≠ benchmark métier.
+Remets corpus/manifeste, config CPT, config SFT commune, splits, état intermédiaire, checkpoints finaux, sorties brutes et `RESULTS.md`.
 
-## Erreurs fréquentes
+Une conclusion utile dit : « Dans ces données et ce budget, l’étape CPT apporte X sur la tâche finale pour Y de coût et Z de régression », ou indique que ce bénéfice n’est pas démontré.
 
-- Comparer Base→SFT avec Base→CPT→SFT mais changer aussi le dataset SFT.
-- Ne pas conserver intermediate CPT.
-- Ne pas calculer coût marginal.
+## 7. Exercices avec corrigés
 
-## Exercices
+### Exercice 1 — Gain marginal
 
-1. Écris l’arbre expérimental de ce projet.
-2. Définis trois métriques intermédiaires et finales.
-3. Explique pourquoi même SFT final est nécessaire pour isoler CPT.
+SFT seul obtient 72 %, CPT→SFT 81 %. Quel gain ?
 
-## Validation — avant de continuer
+<details>
+<summary>Corrigé</summary>
 
-Tu dois pouvoir, sans simplement réciter le code :
+**9 points de pourcentage**, avec effectifs et incertitude à rapporter. Le coût CPT supplémentaire reste à intégrer à la décision.
 
-- Produire control et treatment.
-- Évaluer intermediate et final.
-- Calculer gain marginal CPT.
-- Inclure coût et forgetting dans la décision.
+</details>
+
+### Exercice 2 — Deux datasets SFT
+
+Pourquoi changer aussi les démonstrations SFT empêche-t-il d’isoler le CPT ?
+
+<details>
+<summary>Corrigé</summary>
+
+Le résultat peut alors venir des nouvelles données supervisées autant que de la phase documentaire. Il faut une comparaison qui distingue ces interventions.
+
+</details>
+
+### Exercice 3 — PPL intermédiaire
+
+Une PPL domaine plus basse après CPT suffit-elle à valider le projet ?
+
+<details>
+<summary>Corrigé</summary>
+
+Non. Il faut mesurer la tâche finale après SFT et les capacités à préserver, selon l’objectif du projet.
+
+</details>
+
+### Exercice 4 — Compute
+
+Les branches sont-elles à compute total égal simplement parce qu’elles font le même SFT ?
+
+<details>
+<summary>Corrigé</summary>
+
+Non. La branche CPT a une phase supplémentaire. Le protocole mesure une valeur ajoutée avec coût marginal, pas un match automatique de calcul total.
+
+</details>
+
+## 8. Critères de fin
+
+- [ ] Contrôle, traitement et état intermédiaire sont distincts.
+- [ ] Corpus documentaire, démonstrations et évaluations sont tracés.
+- [ ] Le SFT final comparé est défini selon la même convention.
+- [ ] Les mesures intermédiaires et finales sont conservées.
+- [ ] Coût marginal, régressions et absence éventuelle de gain sont rapportés.
 
 ## Fiche mémo
 
-Le CPT est justifié lorsqu’il apporte une valeur **mesurée** au pipeline final, pas seulement une loss domaine plus basse.
+```text
+La question n’est pas seulement « CPT baisse-t-il sa loss ? »
+Elle est : apporte-t-il une valeur au pipeline final, pour quel coût ?
+```
 
-## Lien avec le module suivant
-
-Le projet 5 prend un modèle SFT et teste l’effet de préférences DPO.
-
----
-
-> **Règle de progression :** si un point de la validation n’est pas clair, refais le micro-exemple et le laboratoire. Le but est de construire un modèle mental solide, pas d’accumuler des commandes.
+Le [projet 60](60_projet_5_dpo.md) étudie une préférence au-delà du SFT.

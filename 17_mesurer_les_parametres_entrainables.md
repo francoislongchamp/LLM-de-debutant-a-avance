@@ -1,151 +1,199 @@
-# Module 17 — Mesurer les paramètres entraînables
+# Module 17 — Auditer les paramètres et l’optimizer
 
-## Pourquoi ce module arrive ici
+## 1. Ce que tu vas apprendre
 
-Après avoir injecté LoRA, il faut quantifier ce que l’on a réellement changé. “Peu de paramètres” doit devenir un nombre, un pourcentage et un budget mémoire approximatif.
+Après une injection LoRA ou un gel de couches, « peu de paramètres apprennent » doit devenir un ensemble de nombres et de vérifications.
 
-## Objectifs
+Tu vas compter total, gelé et entraînable, vérifier ce que l’optimizer connaît, puis mesurer les gradients et ses états après une mise à jour.
 
-Compter les paramètres totaux, entraînables et gelés; calculer leur proportion; relier ce nombre aux gradients, aux états de l’optimizer et à la taille d’un adapter.
+**Prérequis :** modules 5, 7 et 16.
 
-**Prérequis :** Les modules précédents.  
-**Temps indicatif :** 45 à 90 minutes, laboratoire compris.  
-**Niveau :** Fine-tuning léger
+**Temps indicatif :** 90 à 120 minutes.
 
-## Définitions concrètes
+**Matériel :** Python et PyTorch sur CPU. Le laboratoire est autonome et ne dépend pas d’un `trainer` déjà créé.
 
-### Paramètre total
+## 2. Quatre ensembles à distinguer
 
-**Définition concrète.** Tout élément appris présent dans le modèle chargé.
+| Ensemble | Comment le reconnaître | Ce qu’il ne garantit pas |
+| --- | --- | --- |
+| Paramètres présents | `model.parameters()` | Qu’ils reçoivent des gradients |
+| Autorisés au suivi | `requires_grad=True` | Qu’ils participent à la loss |
+| Inclus dans l’optimizer | Ses `param_groups` | Qu’ils reçoivent une mise à jour non nulle |
+| Gradients effectivement calculés | `.grad` après backward | Qu’une amélioration de qualité ait lieu |
 
+Un paramètre peut être entraînable mais absent de l’optimizer. Il peut aussi être inclus mais inutilisé dans ce forward. L’audit doit comparer ces informations plutôt que de regarder seulement un pourcentage.
 
-**Exemple simple.** La base + les adapters LoRA.
+Si tu gèles des poids après qu’ils ont reçu des gradients, traite aussi leurs éventuels gradients et les groupes d’optimizer. Le laboratoire crée les flags et l’optimizer dans le bon ordre, avant tout backward.
 
-### Paramètre entraînable
+## 3. Refaire les calculs à la main
 
-**Définition concrète.** Paramètre avec gradient activé et inclus dans l’optimisation.
-
-
-**Exemple simple.** Les matrices A/B de LoRA.
-
-### Paramètre gelé
-
-**Définition concrète.** Paramètre utilisé dans le forward mais non mis à jour.
-
-
-**Exemple simple.** Les poids de la base.
-
-### Ratio entraînable
-
-**Définition concrète.** Fraction `trainable/total`.
-
-
-**Exemple simple.** 6M sur 600M ≈1 %.
-
-### Optimizer state
-
-**Définition concrète.** État auxiliaire conservé par l’optimizer pour chaque paramètre optimisé.
-
-
-**Exemple simple.** AdamW maintient typiquement des moments pour les paramètres entraînés.
-
-## Intuition simple
-
-LoRA est intéressant non parce que le modèle “devient petit”, mais parce que **la partie qui doit être optimisée devient petite**. La base continue à participer au calcul, mais on évite de stocker gradients et états d’optimizer pour tous ses poids.
-
-## Ce qui se passe réellement sous le capot
-
-1. Parcourir `model.parameters()`.
-2. Sommer `numel()` pour le total.
-3. Sommer seulement les paramètres `requires_grad=True`.
-4. Calculer le ratio.
-5. Inspecter les noms entraînables pour vérifier qu’ils correspondent bien aux adapters attendus.
-6. Estimer mémoire de gradients/optimizer à partir du nombre entraînable et des dtypes/implémentations.
-
-## Exemple minimal à comprendre mentalement
+Notre réseau possède :
 
 ```text
-Total      = 600 000 000
-Trainable  =   6 000 000
-Ratio      = 1 %
+Linear(4,4,bias=False) gelée     → 16 paramètres
+Linear(4,2,bias=False) entraînée →  8 paramètres
+Total                          → 24 paramètres
 ```
-
-Même si 99 % des paramètres sont gelés, les 600M poids sont encore utilisés par le forward. La réduction concerne surtout la **mise à jour** et les états qui l’accompagnent.
-
-## Formules et notation utiles
 
 \[
-ratio=100\times\frac{N_{trainable}}{N_{total}}
+ratio = 100\times\frac{N_{entraînable}}{N_{total}}
 \]
 
-Si les gradients des paramètres entraînables sont BF16, leur mémoire brute est approximativement `2×N_trainable` octets, avant autres états.
+Ici `100×8/24 ≈ 33.33 %`.
 
-## Code minimal observable
+Tous les poids FP32 occupent `24×4 = 96` octets. Les gradients de la tête, si FP32, ajoutent `8×4 = 32` octets.
+
+AdamW crée généralement deux moments pour chaque paramètre concerné et un compteur de step. Dans notre expérience dense FP32, les deux moments de la matrice de 8 poids occupent `2×8×4 = 64` octets, plus le compteur observé.
+
+Le dtype et l’implémentation peuvent changer : mesure les tenseurs plutôt que d’imposer un multiplicateur universel.
+
+## 4. Laboratoire autonome — Avant et après le premier step
 
 ```python
-def count_params(model):
-    total = sum(p.numel() for p in model.parameters())
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    return total, trainable
+import torch
+from torch import nn
 
-total, trainable = count_params(trainer.model)
-print(f"total      : {total:,}")
-print(f"trainable  : {trainable:,}")
-print(f"ratio      : {100*trainable/total:.4f}%")
+torch.manual_seed(42)
+model = nn.Sequential(nn.Linear(4, 4, bias=False), nn.Linear(4, 2, bias=False))
+model[0].requires_grad_(False)
+optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad), lr=0.01)
 
-for name, p in trainer.model.named_parameters():
-    if p.requires_grad:
-        print("TRAIN:", name, tuple(p.shape))
+
+def tensor_bytes(tensors):
+    return sum(tensor.numel() * tensor.element_size() for tensor in tensors)
+
+
+def audit(model, optimizer):
+    parameters = list(model.parameters())
+    total = sum(p.numel() for p in parameters)
+    trainable = sum(p.numel() for p in parameters if p.requires_grad)
+    optimized_ids = {id(p) for group in optimizer.param_groups for p in group['params']}
+    missing = [name for name, p in model.named_parameters()
+               if p.requires_grad and id(p) not in optimized_ids]
+    grads = [p.grad for p in parameters if p.grad is not None]
+    states = [value for state in optimizer.state.values() for value in state.values()
+              if isinstance(value, torch.Tensor)]
+    report = {'total': total, 'trainable': trainable, 'frozen': total - trainable,
+              'ratio_percent': 100 * trainable / total,
+              'weights_bytes': tensor_bytes(parameters),
+              'gradient_bytes': tensor_bytes(grads), 'optimizer_tensor_bytes': tensor_bytes(states),
+              'missing_from_optimizer': missing}
+    return report
+
+
+print('Avant :', audit(model, optimizer))
+x = torch.eye(4)
+target = torch.ones(4, 2)
+optimizer.zero_grad(set_to_none=True)
+loss = nn.functional.mse_loss(model(x), target)
+loss.backward()
+for name, parameter in model.named_parameters():
+    print(name, 'requires_grad=', parameter.requires_grad,
+          'gradient present=', parameter.grad is not None)
+optimizer.step()
+print('Apres :', audit(model, optimizer))
 ```
 
-## Laboratoire guidé
+Tu dois retrouver **24 au total**, **8 entraînables**, **16 gelés**, **96 octets de poids** et **32 octets de gradients après backward**. La liste des paramètres entraînables absents de l’optimizer doit être vide.
 
-1. Mesure le ratio pour r=4, 16 et 64.  
-2. Exporte la liste des paramètres entraînables dans un fichier texte.  
-3. Vérifie qu’aucun poids inattendu de la base n’est entraînable.  
-4. Compare la taille des checkpoints adapters.  
-5. Calcule paramètres LoRA théoriques et compare à la mesure réelle.
+Avant le premier step, les états AdamW sont encore vides. Après, leurs tenseurs apparaissent. Mesurer uniquement juste après la création de l’optimizer sous-estimerait donc son coût final.
 
-## Ce que tu dois observer
+Le code ne mesure ni les objets Python, ni toutes les allocations temporaires, ni les activations conservées pendant backward. Les octets obtenus ne sont pas la mémoire totale du processus.
 
-- Le ratio augmente à peu près linéairement avec r pour un ensemble de cibles fixe.
-- Les biais ou modules_to_save peuvent modifier le compte.
-- Le checkpoint peut contenir métadonnées en plus des tenseurs.
+## 5. Adapter l’audit à LoRA
 
-## À ne pas confondre
+Applique la fonction au modèle PEFT du module 16 et à son optimizer. Exporte les noms, formes, dtypes, flags et participation aux groupes.
 
-- Trainable ratio ≠ réduction identique de VRAM totale.
-- Paramètre gelé ≠ paramètre retiré.
-- Taille d’adapter ≠ nombre exact de paramètres × un seul dtype dans tous les formats.
+Pour une couverture LoRA fixe sans biais ou modules supplémentaires :
 
-## Erreurs fréquentes
+\[
+N_{ajouté} = \sum_{modules\ ciblés} r(in_i+out_i)
+\]
 
-- Faire confiance à une configuration sans inspecter `requires_grad`.
-- Annoncer une économie mémoire en se basant uniquement sur le ratio de paramètres entraînables.
+Si la mesure diffère, examine les cibles réelles, les poids partagés, les biais, les embeddings ou les `modules_to_save`. Le modèle adapté contient aussi les paramètres de base : le dénominateur du ratio est donc généralement base **plus** adapter.
 
-## Exercices
+Exemple : base 600M plus adapter 6M donne `6/606 ≈ 0.9901 %`, et non exactement 1 %. Les ordres de grandeur restent utiles, mais annonce ta convention.
 
-1. Si 12M paramètres sont entraînables sur 1,2B, calcule le ratio.
-2. Explique quelles composantes mémoire diminuent lorsque la base est gelée.
-3. Explique pourquoi les activations existent encore.
+## 6. Pourquoi le ratio ne prédit pas toute la mémoire
 
-## Validation — avant de continuer
+Les activations nécessaires pour entraîner un adapter existent encore. Des gradients peuvent devoir traverser plusieurs blocs gelés pour atteindre les petites matrices entraînables.
 
-Tu dois pouvoir, sans simplement réciter le code :
+Une configuration avec 1 % de paramètres entraînables ne promet donc pas 99 % de VRAM totale en moins. Elle réduit principalement les états associés aux mises à jour de paramètres, pas toutes les autres composantes.
 
-- Compter total/trainable.
-- Calculer le pourcentage.
-- Relier paramètres entraînables aux gradients et optimizer states.
-- Vérifier par noms que seules les bonnes parties sont entraînées.
+La taille du fichier d’adapter inclut aussi format de sauvegarde et métadonnées. Des dtypes différents ou des modules supplémentaires empêchent parfois de la déduire d’un unique `nombre×2 octets`.
+
+## 7. Expériences guidées
+
+1. Ajoute un biais à la dernière couche. Recalcule total, entraînable, gradients et états attendus ; vérifie les mesures.
+2. Construis l’optimizer seulement avec le poids de cette tête, en omettant volontairement son biais entraînable. L’audit doit signaler ce biais absent.
+3. Sur la miniature LoRA du module 16, compare r=1 et r=2 à base et cibles fixes. Vérifie le coût théorique et les noms réels.
+4. Mesure les gradients immédiatement après `zero_grad(set_to_none=True)`. Explique pourquoi leur mémoire de tenseurs peut alors être nulle sans que l’architecture ait changé.
+
+## 8. Exercices avec corrigés
+
+### Exercice 1 — Ratio exact
+
+Un modèle adapté totalise 1.2 milliard de paramètres, dont 12 millions entraînables. Quel ratio ?
+
+<details>
+<summary>Corrigé</summary>
+
+`12M/1200M = 0.01`, donc **1 %**. Ici le total annoncé inclut déjà tous les paramètres présents.
+
+</details>
+
+### Exercice 2 — Absence de gradient
+
+Un paramètre a `requires_grad=True` mais `.grad=None` après backward. Quelles vérifications faire ?
+
+<details>
+<summary>Corrigé</summary>
+
+Vérifier sa participation au calcul de loss, le suivi autograd et le fait que l’on lit un paramètre feuille. Vérifier aussi quand les gradients sont remis à zéro ; leur absence n’est pas une mesure de qualité.
+
+</details>
+
+### Exercice 3 — Optimizer vide
+
+Pourquoi ses états sont-ils vides avant le premier step dans ce laboratoire ?
+
+<details>
+<summary>Corrigé</summary>
+
+AdamW initialise ici ses états de manière différée pour les paramètres concernés lorsqu’une mise à jour les utilise. Il faut mesurer au bon moment du cycle.
+
+</details>
+
+### Exercice 4 — Poids gelés
+
+La base est gelée. Pourquoi sa taille reste-t-elle incluse dans la mémoire des poids ?
+
+<details>
+<summary>Corrigé</summary>
+
+Elle est encore stockée et nécessaire au forward. Le gel limite les mises à jour et leurs états ; il ne supprime pas la contribution de base.
+
+</details>
+
+## 9. Validation — avant de continuer
+
+- [ ] Je calcule total, entraînable, gelé et ratio avec un dénominateur annoncé.
+- [ ] Je compare les flags aux groupes de l’optimizer.
+- [ ] Je distingue gradient absent et paramètre non optimisé.
+- [ ] Je mesure les états après le premier step.
+- [ ] Je compare les comptes LoRA théoriques et réels.
+- [ ] Je peux expliquer les limites de ces octets et du ratio.
 
 ## Fiche mémo
 
-Mesurer évite les suppositions : un LoRA correctement configuré se voit dans les noms, `requires_grad`, le ratio et la taille du checkpoint.
+```text
+Compter → inspecter les noms → vérifier les groupes → backward → inspecter les états.
+Le coût de l’optimizer ne se voit pas forcément avant sa première mise à jour.
+Ratio entraînable et économie de mémoire totale sont deux mesures différentes.
+```
 
-## Lien avec le module suivant
+Le [module 18](18_rank_lora_alpha_et_dropout.md) étudie les réglages qui changent la taille et la dynamique des adapters.
 
-Le module 18 étudie comment rank, alpha et dropout changent la capacité de l’adapter.
+## Référence
 
----
-
-> **Règle de progression :** si un point de la validation n’est pas clair, refais le micro-exemple et le laboratoire. Le but est de construire un modèle mental solide, pas d’accumuler des commandes.
+[PyTorch : AdamW](https://docs.pytorch.org/docs/stable/generated/torch.optim.AdamW.html) — règle de mise à jour et paramètres d’optimizer.

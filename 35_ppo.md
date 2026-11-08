@@ -1,161 +1,198 @@
-# Module 35 — PPO
+# Module 35 — Comprendre le clipping PPO et le rôle du critic
 
-## Pourquoi ce module arrive ici
+## 1. Ce que tu vas apprendre
 
-PPO est un algorithme majeur de policy optimization et un repère historique du RLHF. Même si d’autres méthodes sont souvent choisies aujourd’hui, comprendre PPO clarifie value model, advantage, ratio de policy et clipping.
+**PPO**, *Proximal Policy Optimization*, collecte des trajectoires puis optimise un objectif qui modère certaines incitations à changer la policy trop fortement sur ce lot.
 
-## Objectifs
+Tu vas calculer les deux branches du surrogate, distinguer reward et value, puis entraîner une petite policy avec un critic.
 
-Comprendre actor/policy, critic/value, old policy, probability ratio, clipped objective et KL. Savoir expliquer le pipeline RLHF classique sans devoir immédiatement déployer une grande infrastructure PPO.
+**Prérequis :** modules 30, 34 et notions de gradients.
 
-**Prérequis :** Les modules précédents.  
-**Temps indicatif :** 45 à 90 minutes, laboratoire compris.  
-**Niveau :** Reinforcement learning
+**Temps indicatif :** deux séances de 60 à 90 minutes.
 
-## Définitions concrètes
+**Matériel :** PyTorch sur CPU ; aucun téléchargement.
 
-### Actor / policy
+## 2. Quatre rôles dans un pipeline RLHF classique
 
-**Définition concrète.** Modèle qui génère les actions.
+| Élément | Produit ou rôle |
+| --- | --- |
+| Actor/policy | Actions ou tokens |
+| Critic/value | Return attendu depuis une situation |
+| Reward function/model | Note des conséquences ou réponses |
+| Ancienne policy | Probabilité des actions au moment de leur collecte |
 
+Une référence fixe pour une pénalité KL peut aussi être présente. Elle est encore distincte de l’ancienne policy, renouvelée à chaque lot de trajectoires.
 
-**Exemple simple.** Le LLM à optimiser.
+Le critic estime une espérance de return, pas la vérité d’une réponse donnée. Le reward et la value peuvent produire chacun un scalaire sans représenter la même quantité.
 
-### Critic / value model
+## 3. Refaire le ratio
 
-**Définition concrète.** Modèle/tête estimant le return attendu pour réduire la variance du signal.
-
-
-**Exemple simple.** Prédit une valeur pour les états/tokens.
-
-### Old policy
-
-**Définition concrète.** Version de la policy ayant généré les trajectoires du batch courant.
-
-
-**Exemple simple.** Sert à mesurer le ratio de changement.
-
-### Probability ratio
-
-**Définition concrète.** `π_new(a|s)/π_old(a|s)`.
-
-
-**Exemple simple.** Ratio 1 = probabilité inchangée.
-
-### Clipping
-
-**Définition concrète.** Limitation de l’incitation à modifier trop fortement le ratio pendant une update.
-
-
-**Exemple simple.** Empêche un avantage de pousser sans limite un changement local.
-
-### PPO
-
-**Définition concrète.** Proximal Policy Optimization : famille d’objectifs maintenant les updates relativement proches tout en maximisant les advantages.
-
-
-**Exemple simple.** Utilisé historiquement dans plusieurs pipelines RLHF.
-
-## Intuition simple
-
-Si une réponse a eu une bonne récompense, on veut augmenter sa probabilité — mais pas transformer brutalement le modèle en une seule update. PPO met une “zone de prudence” autour du changement de probabilité.
-
-## Ce qui se passe réellement sous le capot
-
-1. Collecter des trajectoires avec la policy courante.
-2. Calculer rewards.
-3. Estimer values/returns et advantages.
-4. Calculer le ratio nouvelle/ancienne policy pour les actions observées.
-5. Appliquer l’objectif PPO avec clipping.
-6. Entraîner aussi le critic/value selon sa loss.
-7. Ajouter éventuellement contrôle KL vers une référence.
-8. Répéter plusieurs mini-epochs sur le batch selon configuration, puis regénérer.
-
-## Exemple minimal à comprendre mentalement
-
-Supposons qu’un token d’une bonne trajectoire avait probabilité 0.20 sous old policy. Nouvelle policy propose 0.30 :
-
-```text
-ratio = 0.30/0.20 = 1.5
-```
-
-Avec une plage de clipping autour de 1, une partie de l’objectif empêche de continuer à récompenser sans limite ce grand déplacement pendant la même update.
-
-## Formules et notation utiles
-
-Objectif PPO simplifié :
+Si une action avait une probabilité 0.20 et possède maintenant 0.30 :
 
 \[
-L^{clip}=\mathbb E[\min(r_tA_t,\;clip(r_t,1-\epsilon,1+\epsilon)A_t)]
+\rho = \frac{0.30}{0.20}=1.5
 \]
 
-avec :
+Pour la stabilité numérique, on calcule souvent `exp(logp_new−logp_old)` sur la même action et le même contexte.
+
+L’ancienne log-probabilité doit rester fixe pendant les updates qui réutilisent ces données. La recalculer à chaque mini-update avec les poids courants rendrait le ratio artificiellement proche de 1.
+
+## 4. Le minimum des deux branches
 
 \[
-r_t=\frac{\pi_\theta(a_t|s_t)}{\pi_{old}(a_t|s_t)}
+J_{clip}=mean\left[\min(\rho\widehat A,
+clip(\rho,1-\varepsilon,1+\varepsilon)\widehat A)\right]
 \]
 
-C’est une intuition de base; les implémentations LLM ajoutent souvent value loss, entropy/KL et nombreux détails.
+On maximise J, ou minimise −J. Avec epsilon=0.2 :
 
-## Code minimal observable
+| Ratio | Advantage | rho×A | clip(rho)×A | Minimum |
+| --- | --- | --- | --- | --- |
+| 1.5 | +1 | 1.5 | 1.2 | 1.2 |
+| 1.5 | −1 | −1.5 | −1.2 | −1.5 |
+| 0.5 | −1 | −0.5 | −0.8 | −0.8 |
+| 0.9 | +1 | 0.9 | 0.9 | 0.9 |
+
+Pour un avantage positif, l’incitation directe cesse de croître au-delà du bord haut. Pour un avantage négatif, le côté utile du clipping est inversé.
+
+Il ne s’agit pas de forcer toutes les probabilités dans une boîte. Paramètres partagés, autres actions et autres termes de loss peuvent continuer à changer la distribution. Le clipping n’est pas une garantie de KL bornée.
+
+## 5. Une value loss distincte
+
+Un critic peut être ajusté avec une erreur entre sa prédiction `V(s)` et une estimation du return. Une forme simple est une MSE.
+
+Le signal d’actor peut utiliser `G−V(s)` traité comme constant pendant son calcul de gradient. Dans des trajectoires longues, des estimateurs comme GAE ajoutent des détails de bootstrap et d’actualisation ; notre tâche à une seule action n’en a pas besoin.
+
+Une mauvaise value baseline peut augmenter la variance ou dégrader l’apprentissage. Elle ajoute aussi calcul, mémoire et hyperparamètres à vérifier.
+
+## 6. Laboratoire autonome — PPO miniature sur une seule question
+
+La policy choisit entre deux actions : la première reçoit 1, la seconde 0. Le critic est un unique scalaire car il n’y a qu’un état. Ce réseau ne génère pas de texte et ne démontre pas un RLHF complet.
 
 ```python
-def ratio(p_new, p_old):
-    return p_new / p_old
+import torch
 
-print(ratio(0.30, 0.20))  # 1.5
-print(ratio(0.18, 0.20))  # 0.9
+torch.manual_seed(42)
+actor_logits = torch.nn.Parameter(torch.zeros(2))
+critic = torch.nn.Parameter(torch.tensor(0.0))
+optimizer = torch.optim.Adam([actor_logits, critic], lr=0.03)
+epsilon = 0.2
+
+for rollout in range(1, 51):
+    with torch.no_grad():
+        old = torch.distributions.Categorical(logits=actor_logits.detach())
+        actions = old.sample((128,))
+        old_logp = old.log_prob(actions)
+        returns = (actions == 0).float()
+        advantages = returns - critic.detach()
+
+    for _ in range(4):
+        distribution = torch.distributions.Categorical(logits=actor_logits)
+        ratio = (distribution.log_prob(actions) - old_logp).exp()
+        surrogate = torch.minimum(ratio * advantages,
+                                  ratio.clamp(1 - epsilon, 1 + epsilon) * advantages)
+        actor_loss = -surrogate.mean()
+        value_loss = (critic - returns).square().mean()
+        loss = actor_loss + 0.5 * value_loss - 0.01 * distribution.entropy()
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+
+    if rollout == 1 or rollout % 10 == 0:
+        print('collecte=', rollout, 'reward lot=', returns.mean().item(),
+              'probabilite action correcte=', actor_logits.detach().softmax(-1)[0].item(),
+              'value=', critic.item())
+
+ratios = torch.tensor([1.5, 1.5, 0.5, 0.9])
+advantages_example = torch.tensor([1.0, -1.0, -1.0, 1.0])
+objective = torch.minimum(ratios * advantages_example,
+                         ratios.clamp(0.8, 1.2) * advantages_example)
+print('Table du surrogate :', objective.tolist())
 ```
 
-## Laboratoire guidé
+Tu dois retrouver la table **[1.2,−1.5,−0.8,0.9]**, aux arrondis près. La probabilité de l’action récompensée doit augmenter nettement depuis 0.5.
 
-1. Calcule manuellement des ratios pour plusieurs probabilités.  
-2. Dessine l’effet de `clip(r,0.8,1.2)` pour r=0.5,0.9,1.1,1.8.  
-3. Simule des advantages positifs et négatifs et explique l’effet attendu.  
-4. Étudie l’API PPO de la version de TRL ou framework que tu utilises uniquement après avoir compris ces quantités.  
-5. Compare conceptuellement coût PPO (policy+value+generation) à DPO.
+Il y a **50 collectes**, **6 400 actions échantillonnées** et **200 updates**. Le critic cherche une valeur proche du reward attendu de la policy, mais son ajustement ne sera pas exact à chaque instant.
 
-## Ce que tu dois observer
+## 7. Ce qui a été volontairement simplifié
 
-- PPO est plus complexe opérationnellement que DPO.
-- Le critic est une source supplémentaire de mémoire, calcul et erreurs.
-- Clipping limite une partie de l’incitation mais ne garantit pas l’absence de dérive.
+Le pilote utilise un seul état, une action par épisode, aucun bootstrap, pas de modèle de reward appris et pas de référence KL. Il vérifie le surrogate, la value loss et la réutilisation limitée des collectes.
 
-## À ne pas confondre
+Un PPO de LLM doit traiter les fins d’épisode, tokens de padding, retours par token, value head, génération, distribution de référence éventuelle et coûts de plusieurs réseaux.
 
-- PPO clipping ≠ gradient clipping.
-- Critic ≠ reward model, même s’ils produisent tous deux des scalaires.
-- Old policy ≠ reference policy dans tous les sens; leurs rôles diffèrent.
+Les API PPO des frameworks ont évolué ; le noyau mathématique ci-dessus reste inspectable sans dépendre d’une ancienne signature de `PPOTrainer`. Pour une mise à l’échelle, fige une version et suis sa documentation d’ensemble, pas un mélange d’extraits de versions différentes.
 
-## Erreurs fréquentes
+## 8. Expériences guidées
 
-- Mémoriser l’équation sans savoir ce que représente le ratio.
-- Confondre reward, value et advantage.
-- Déployer PPO à grande échelle avant une reward validée.
+1. Calcule la table avec un avantage de magnitude 2. Vérifie le sens de chaque branche.
+2. Remplace la value baseline par une constante 0. Compare les résultats sur plusieurs seeds, sans conclure depuis un seul run.
+3. Augmente le nombre d’updates sur une même collecte. Logge les ratios et la dérive ; le clipping ne rend pas une réutilisation illimitée sans risque.
+4. Supprime l’entropy bonus dans une copie. Observe la concentration de la policy et distingue ce bonus du clipping.
 
-## Exercices
+## 9. Exercices avec corrigés
 
-1. Calcule le ratio pour p_old=.1,p_new=.08.
-2. Explique l’effet attendu d’un advantage négatif.
-3. Compare reward model et value model en une phrase chacun.
+### Exercice 1 — Ratio
 
-## Validation — avant de continuer
+p_old=0.1 et p_new=0.08 : quel ratio ?
 
-Tu dois pouvoir, sans simplement réciter le code :
+<details>
+<summary>Corrigé</summary>
 
-- Définir policy/value/reward/advantage.
-- Calculer un probability ratio.
-- Expliquer le clipping PPO.
-- Distinguer PPO de DPO et GRPO au niveau du flux de données.
+**0.8**. Il mesure le changement relatif de probabilité de cette action dans ce contexte.
+
+</details>
+
+### Exercice 2 — Advantage négatif
+
+Pourquoi min(1.5×−1,1.2×−1) vaut-il −1.5 et non −1.2 ?
+
+<details>
+<summary>Corrigé</summary>
+
+Le minimum se prend après multiplication. Augmenter une action défavorable reste pénalisé ; le clipping ne doit pas protéger ce déplacement défavorable de la même manière qu’un gain excessif.
+
+</details>
+
+### Exercice 3 — Deux clippings
+
+PPO clipping et gradient clipping limitent-ils la même quantité ?
+
+<details>
+<summary>Corrigé</summary>
+
+Non. Le premier intervient dans le surrogate fondé sur un ratio de probabilités ; le second limite une norme de gradients avant l’optimizer step.
+
+</details>
+
+### Exercice 4 — Critic ou correcteur ?
+
+Le critic prédit 0.8 pour un préfixe. Est-ce un score certifiant que la réponse finale est vraie ?
+
+<details>
+<summary>Corrigé</summary>
+
+Non. Il estime un return attendu sous la tâche et la policy. Ce n’est pas un oracle factuel ni nécessairement le score d’une réponse terminée.
+
+</details>
+
+## 10. Validation — avant de continuer
+
+- [ ] Je calcule les deux branches pour des avantages positifs et négatifs.
+- [ ] Je distingue critic, reward, ancienne policy et référence.
+- [ ] Je conserve l’ancienne log-probabilité pendant les updates d’un lot.
+- [ ] Je peux commenter les compteurs et la value du pilote.
+- [ ] Je sais pourquoi clipping et proximité globale ne sont pas synonymes.
 
 ## Fiche mémo
 
-PPO combine trajectoires online, advantages, critic et updates “proximales” pour éviter de trop déplacer la policy en une fois.
+```text
+Collecter → estimer returns/advantages → figer old_logp
+→ quelques updates actor/critic → nouvelle collecte.
+Le surrogate clippe une incitation, pas toute la distribution.
+```
 
-## Lien avec le module suivant
+Le [module 36](36_kl_divergence_et_controle_de_derive.md) mesure une divergence explicite entre distributions.
 
-Le module 36 formalise une autre notion de proximité très utilisée : la divergence KL.
+## Référence
 
----
-
-> **Règle de progression :** si un point de la validation n’est pas clair, refais le micro-exemple et le laboratoire. Le but est de construire un modèle mental solide, pas d’accumuler des commandes.
+[Article PPO](https://arxiv.org/abs/1707.06347) — objectifs proximaux et optimisation sur collectes.

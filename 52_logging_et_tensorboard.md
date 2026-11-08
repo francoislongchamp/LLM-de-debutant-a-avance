@@ -1,141 +1,189 @@
-# Module 52 — Logging et TensorBoard
+# Module 52 — Enregistrer des métriques que l’on peut relire
 
-## Pourquoi ce module arrive ici
+## 1. Ce que tu vas apprendre
 
-Sans séries temporelles de loss, LR, gradients, mémoire et débit, le diagnostic devient une suite d’impressions. Le logging transforme le run en expérience observable.
+Des logs utiles relient une métrique à une update, des données, une configuration et une convention. Une jolie courbe sans ces informations reste difficile à expliquer.
 
-## Objectifs
+Tu vas produire JSONL et événements TensorBoard, puis recharger les scalaires pour vérifier qu’ils existent réellement.
 
-Choisir les métriques essentielles, comprendre step vs wall time, utiliser TensorBoard et créer des conventions de run reproductibles.
+**Prérequis :** modules 22, 42, 43 et 51.
 
-**Prérequis :** Les modules précédents.  
-**Temps indicatif :** 45 à 90 minutes, laboratoire compris.  
-**Niveau :** Fiabilité du training
+**Temps indicatif :** 90 à 150 minutes.
 
-## Définitions concrètes
+**Matériel :** PyTorch et TensorBoard sur CPU. Le script écrit localement sans envoyer de données à un service.
 
-### Scalar metric
+## 2. Définir le sens de chaque scalaire
 
-**Définition concrète.** Valeur numérique enregistrée avec un step.
+| Nom possible | Convention à préciser |
+| --- | --- |
+| train/loss | Avant/après update, moyenne par cible ou par batch |
+| eval/loss | Split, masques et pondération |
+| optimizer/lr_used | LR réellement utilisé par l’update |
+| gradient/norm_before_clip | Norme avant la limitation |
+| data/seen_targets | Cibles actives présentées, répétitions comprises |
+| system/throughput | Unité et région de temps mesurée |
+| memory/peak_allocated | Appareil et phase du pic |
+| reward/component_* | Règle/version de chaque composante |
 
+Un `global_step` compte les updates, pas les micro-batches. Le temps réel inclut parfois évaluation, sauvegardes et attentes ; un débit sur la seule région de calcul doit être nommé comme tel.
 
-**Exemple simple.** train/loss.
+## 3. Séparer configuration et série de mesures
 
-### Throughput
+Le nom du dossier peut aider à se repérer, mais le fichier de configuration est la référence. Garde notamment modèle/révision, données/splits, tokenizer, code, seeds, versions, objectif, batch, accumulation, précision et réglages d’optimizer.
 
-**Définition concrète.** Quantité traitée par unité de temps.
+Utilise un identifiant de run unique. Réutiliser le même dossier peut mélanger plusieurs séries ou créer des points de même step avec des valeurs différentes.
 
+Un log est un artefact de mesure ; il ne sauvegarde pas les poids et ne remplace pas un checkpoint.
 
-**Exemple simple.** tokens/s.
+## 4. Laboratoire autonome — Écrire et recharger les événements
 
-### Wall time
+Le réseau apprend une relation numérique simple. Le débit est mesuré en **exemples**, pas en tokens. Le dossier `outputs/module52/run-*` est créé avec un identifiant neuf.
 
-**Définition concrète.** Temps réel écoulé.
+```python
+import json
+import time
+import uuid
+from pathlib import Path
+import torch
+from torch import nn
+from torch.utils.tensorboard import SummaryWriter
+from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
+torch.manual_seed(42)
+root = Path('outputs/module52') / ('run-' + uuid.uuid4().hex[:8])
+root.mkdir(parents=True)
+config = {'task': 'synthetic-linear-v1', 'seed': 42, 'steps': 10,
+          'loss': 'mean_squared_error_per_example', 'torch': str(torch.__version__)}
+(root / 'config.json').write_text(json.dumps(config, indent=2), encoding='utf-8')
+model = nn.Linear(1, 1)
+optimizer = torch.optim.AdamW(model.parameters(), lr=0.05, weight_decay=0.0)
+x = torch.arange(1, 5, dtype=torch.float32).reshape(-1, 1)
+y = 2 * x + 1
+seen_examples = 0
 
-**Exemple simple.** Utile pour coût/efficacité.
+with SummaryWriter(log_dir=str(root / 'events')) as writer, (root / 'metrics.jsonl').open('w', encoding='utf-8') as file:
+    for step in range(1, 11):
+        start = time.perf_counter()
+        optimizer.zero_grad(set_to_none=True)
+        loss = nn.functional.mse_loss(model(x), y)
+        loss.backward()
+        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        used_lr = optimizer.param_groups[0]['lr']
+        optimizer.step()
+        compute_seconds = time.perf_counter() - start
+        seen_examples += len(x)
+        record = {'step': step, 'train/loss': loss.item(),
+                  'optimizer/lr_used': used_lr, 'gradient/norm_before_clip': norm.item(),
+                  'data/seen_examples': seen_examples,
+                  'system/step_examples_per_second': len(x) / compute_seconds}
+        file.write(json.dumps(record, allow_nan=False) + '\n')
+        for name, value in record.items():
+            if name != 'step':
+                writer.add_scalar(name, value, step)
+    writer.flush()
 
-### Run metadata
-
-**Définition concrète.** Configuration décrivant l’expérience.
-
-
-**Exemple simple.** git commit, model, dataset, seed, hardware.
-
-### TensorBoard
-
-**Définition concrète.** Interface pour visualiser scalars, histogrammes et autres logs compatibles.
-
-
-**Exemple simple.** Comparer plusieurs runs de loss/LR.
-
-## Intuition simple
-
-Un run sans métadonnées est comme une expérience de laboratoire sans cahier : même un bon résultat devient difficile à reproduire ou expliquer.
-
-## Ce qui se passe réellement sous le capot
-
-1. Donner un identifiant unique au run.
-2. Sauvegarder config complète avant training.
-3. Logger train loss, eval loss, LR, grad norm, tokens/s et mémoire utile.
-4. Logger reward components pour RL.
-5. Enregistrer global step/tokens seen/wall time.
-6. Visualiser plusieurs runs avec axes comparables.
-7. Conserver raw logs avec checkpoints et résultats benchmark.
-
-## Exemple minimal à comprendre mentalement
-
-Convention utile :
-
-```text
-runs/2026-10-04_qwen06b_lora_r16_seed42/
-  config.yaml
-  metrics/
-  checkpoints/
-  eval/
-  environment.txt
+accumulator = EventAccumulator(str(root / 'events')).Reload()
+events = accumulator.Scalars('train/loss')
+assert [event.step for event in events] == list(range(1, 11))
+print('Scalaires disponibles :', accumulator.Tags()['scalars'])
+print('Points loss :', len(events), 'exemples vus :', seen_examples)
+print('Dossier :', root.resolve())
 ```
 
-Le nom aide, mais la vraie source de vérité reste la configuration stockée.
+Tu dois retrouver **10 points de loss**, les steps 1 à 10 et **40 expositions d’exemples**. Le script vérifie des données relues depuis le fichier d’événements, pas seulement des appels d’écriture.
 
-## Code minimal observable
+Le chronomètre exclut ici l’écriture JSONL et TensorBoard. Les premières allocations peuvent affecter les premières durées ; ce débit miniature n’est pas un benchmark matériel.
+
+## 5. Visualiser sans modifier la mesure
+
+Dans l’environnement où TensorBoard est installé :
 
 ```bash
-tensorboard --logdir outputs/
-
-# Puis ouvrir l’adresse locale indiquée par TensorBoard.
-# Dans Trainer/SFTConfig, utiliser report_to="tensorboard" selon ta version/config.
+tensorboard --logdir outputs/module52
 ```
 
-## Laboratoire guidé
+Ouvre ensuite l’adresse locale indiquée. Compare séries brutes et lissées, vérifie les axes et la convention de lissage de l’interface.
 
-1. Logge au minimum train/loss, eval/loss, learning_rate.  
-2. Ajoute grad_norm, tokens/s et peak memory si disponible.  
-3. Lance deux runs ne différant que par un hyperparamètre.  
-4. Superpose les courbes.  
-5. Écris une conclusion fondée sur les courbes et le benchmark, pas seulement sur la dernière loss.
+Une capture de courbe ne remplace pas les scalaires et la configuration. Conserve les fichiers originaux pour les analyses et comparaisons du module 54.
 
-## Ce que tu dois observer
+## 6. Logging distribué et coût de mesure
 
-- Une fréquence de logging trop haute peut ajouter du bruit/overhead; trop basse masque les événements.
-- Comparer des courbes en steps peut être trompeur si batch global diffère; tokens vus peut aider.
-- Le meilleur throughput n’est pas forcément la meilleure qualité.
+Les collectives qui produisent une métrique globale peuvent demander tous les ranks, même si seul rank 0 écrit la série finale. La valeur écrite doit réellement être globale, pas seulement la loss locale du rank 0 renommée.
 
-## À ne pas confondre
+Des `.item()` fréquents sur GPU, des histogrammes complets ou de grandes générations peuvent synchroniser et ralentir le run. Choisis une fréquence qui conserve les événements utiles sans saturer le pipeline.
 
-- Logging ≠ evaluation.
-- TensorBoard ≠ stockage du modèle.
-- Wall time ≠ GPU time exactement.
+Pour un incident, garde si possible IDs de batch/source et version des données. N’enregistre pas automatiquement toutes les données brutes d’un corpus sensible : définis ce qui est utile et approprié à conserver.
 
-## Erreurs fréquentes
+## 7. Expériences guidées
 
-- Réutiliser le même output_dir et mélanger les runs.
-- Ne pas logguer le LR réel.
-- Oublier les versions package/CUDA/driver dans un bug difficile.
+1. Lance deux runs avec un seul LR différent. Vérifie dossiers, configs et séries distincts.
+2. Compare en steps puis en exemples/tokens vus quand les batches diffèrent.
+3. Ajoute validation périodique et coût d’évaluation séparé. Ne confonds pas temps de calcul d’update et coût total du projet.
+4. Exporte un petit tableau depuis le JSONL pour retrouver le plus gros gradient et son step.
 
-## Exercices
+## 8. Exercices avec corrigés
 
-1. Définis 10 métriques par priorité essential/nice-to-have.
-2. Explique quand utiliser steps vs tokens vus en axe x.
-3. Crée une convention de noms de runs.
+### Exercice 1 — Unités
 
-## Validation — avant de continuer
+Une miniature numérique traite quatre lignes par step. Peut-on appeler son débit tokens/s ?
 
-Tu dois pouvoir, sans simplement réciter le code :
+<details>
+<summary>Corrigé</summary>
 
-- Lancer TensorBoard sur deux runs.
-- Retrouver config et métriques d’un run.
-- Comparer sur un axe cohérent.
-- Produire une conclusion reproductible.
+Non. Ce sont ici des exemples numériques. Les unités doivent correspondre aux données réellement comptées.
+
+</details>
+
+### Exercice 2 — LR
+
+Pourquoi lire le LR avant `scheduler.step()` pour nommer `lr_used` ?
+
+<details>
+<summary>Corrigé</summary>
+
+Le scheduler prépare le LR suivant. Pour annoter l’update courante, il faut enregistrer celui qui a servi à son optimizer step.
+
+</details>
+
+### Exercice 3 — TensorBoard
+
+Le dossier d’événements permet-il de reconstituer les poids du modèle ?
+
+<details>
+<summary>Corrigé</summary>
+
+Pas dans ce protocole. Les scalaires décrivent des mesures, tandis qu’un checkpoint conserve les états nécessaires à l’inférence ou à la reprise.
+
+</details>
+
+### Exercice 4 — Rank zéro
+
+Logger seulement rank 0 signifie-t-il que sa loss locale devient automatiquement une moyenne globale ?
+
+<details>
+<summary>Corrigé</summary>
+
+Non. Il faut d’abord agréger sommes et effectifs selon la convention voulue, puis écrire le résultat.
+
+</details>
+
+## 9. Validation — avant de continuer
+
+- [ ] Je définis noms, unités et moments de mesure.
+- [ ] Je conserve config et séries dans un run unique.
+- [ ] Je relis les 10 scalaires réellement écrits.
+- [ ] Je sais lancer TensorBoard et garder les valeurs brutes.
+- [ ] Je distingue métriques locales/globales et coût de logging.
 
 ## Fiche mémo
 
-Le logging transforme le training en expérience scientifique : on peut voir, comparer, expliquer et reproduire.
+```text
+Un nombre doit avoir un step, une unité, une convention et une expérience identifiable.
+Écrire les métriques, les relire, puis les interpréter avec leur configuration.
+```
 
-## Lien avec le module suivant
+Le [module 53](53_construire_un_benchmark.md) mesure les comportements au-delà de la loss.
 
-Le module 53 construit le benchmark qui mesure ce que la loss de training ne peut pas résumer.
+## Référence
 
----
-
-> **Règle de progression :** si un point de la validation n’est pas clair, refais le micro-exemple et le laboratoire. Le but est de construire un modèle mental solide, pas d’accumuler des commandes.
+[PyTorch : TensorBoard](https://docs.pytorch.org/docs/stable/tensorboard.html).

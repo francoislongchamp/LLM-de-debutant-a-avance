@@ -1,143 +1,182 @@
-# Module 58 — Projet 3 — LoRA vs full fine-tuning
+# Module 58 — Projet 3 : comparer LoRA et full fine-tuning sans cacher les coûts
 
-## Pourquoi ce module arrive ici
+## 1. Ce que tu vas construire
 
-La comparaison la plus instructive du cours est de voir ce que gagne réellement le full FT lorsque toutes les matrices peuvent changer, et ce qu’il coûte en mémoire, stockage et forgetting.
+Deux branches partent du même état appris. L’une utilise une correction LoRA, l’autre autorise directement les poids principaux à changer.
 
-## Objectifs
+Tu vas réaliser un pilote numérique contrôlé, puis construire la comparaison sur un petit LLM avec domaine, capacités à préserver et budget explicites.
 
-Comparer LoRA et full FT sur un petit modèle avec budgets comparables, mesurer domaine/généralisation/forgetting, coût et taille checkpoint.
+**Prérequis :** modules 15 à 24, 50 à 56.
 
-**Prérequis :** Les modules précédents.  
-**Temps indicatif :** 4 à 10 heures; choisir un modèle suffisamment petit pour un full FT sûr.  
-**Niveau :** Projet intégrateur
+**Temps indicatif :** pilote court sur CPU ; projet réel de plusieurs heures selon le modèle et le tuning.
 
-## Définitions concrètes
+**Matériel :** PyTorch et PEFT pour le pilote ; ressources adaptées au step complet du LLM pour la suite.
 
-### Budget matched
+## 2. La bonne question expérimentale
 
-**Définition concrète.** Tentative de rendre deux expériences comparables sur tokens/steps/données.
+Full FT dispose d’une liberté différente de LoRA, pas d’une qualité automatiquement supérieure. La question est de savoir si un gain utile justifie le coût et les régressions sous les contraintes choisies.
 
+Deux protocoles sont possibles : réglages aussi fixes que possible pour une ablation locale, ou réglages adaptés à chaque méthode avec un budget de tuning comparable.
 
-**Exemple simple.** Même nombre de tokens vus.
+Le même LR n’est pas une garantie d’équité. Les données, splits, scoring et identité de base doivent en revanche être cohérents avec la question.
 
-### Capacity difference
+## 3. Pilote contrôlé : correction connue
 
-**Définition concrète.** Différence intrinsèque de paramètres modifiables entre méthodes.
+Notre petite matrice 8×8 démarre du même état dans les deux branches. Une correction de rang 1 est ajoutée à la cible ; LoRA r=2 peut donc la représenter.
 
+Le « vieux comportement » et le nouveau sont volontairement en conflit sur les mêmes entrées. L’erreur sur l’ancienne sortie rend le déplacement visible, sans prétendre mesurer le catastrophic forgetting d’un vrai LLM.
 
-**Exemple simple.** Full FT peut modifier tout W.
+Les entrées de validation sont différentes du train. Le montage reste artificiel et beaucoup plus simple qu’un corpus linguistique.
 
-### Forgetting delta
+## 4. Laboratoire autonome — Deux branches, mêmes données
 
-**Définition concrète.** Régression sur benchmark général après training.
+```python
+from copy import deepcopy
+import time
+import torch
+from torch import nn
+from peft import LoraConfig, get_peft_model
 
+class Base(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.proj = nn.Linear(8, 8, bias=False)
 
-**Exemple simple.** Après-base.
+    def forward(self, x):
+        return self.proj(x)
 
-### Checkpoint footprint
-
-**Définition concrète.** Espace disque nécessaire pour l’artefact final.
-
-
-**Exemple simple.** Adapter vs modèle complet.
-
-## Intuition simple
-
-Full FT a plus de liberté. La question expérimentale n’est pas “peut-il fitter le train ?”, mais “cette liberté supplémentaire produit-elle un gain utile assez grand pour justifier coût et régressions ?”.
-
-## Ce qui se passe réellement sous le capot
-
-1. Choisir un modèle qui tient en full FT avec marge.
-2. Fixer datasets et benchmark.
-3. Définir LoRA stable.
-4. Définir full FT avec LR adapté, pas copié du LoRA.
-5. Matcher le budget de tokens/steps autant que pertinent.
-6. Évaluer domaine, validation et général.
-7. Mesurer VRAM, temps, checkpoint.
-8. Calculer forgetting.
-9. Comparer le front qualité/coût.
-
-## Exemple minimal à comprendre mentalement
-
-```text
-              LoRA     Full FT
-Domain        85       87
-General       78       71
-Peak VRAM     9 GB     18 GB
-Checkpoint    80 MB    1.2 GB
+torch.manual_seed(42)
+initial = Base()
+train_x = torch.randn(32, 8)
+val_x = torch.randn(16, 8)
+with torch.no_grad():
+    train_y = initial(train_x) + train_x.sum(-1, keepdim=True).expand(-1, 8) / 8
+    val_y = initial(val_x) + val_x.sum(-1, keepdim=True).expand(-1, 8) / 8
+    old_val_y = initial(val_x).clone()
+reports = []
+for method, lr in [('LoRA', 0.05), ('FullFT', 0.03)]:
+    torch.manual_seed(123)
+    model = deepcopy(initial)
+    if method == 'LoRA':
+        model = get_peft_model(model, LoraConfig(r=2, lora_alpha=2, lora_dropout=0.0,
+                                               target_modules=['proj'], bias='none'))
+    optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad), lr=lr, weight_decay=0.0)
+    model.train()
+    start = time.perf_counter()
+    for step in range(100):
+        optimizer.zero_grad(set_to_none=True)
+        loss = nn.functional.mse_loss(model(train_x), train_y)
+        loss.backward()
+        optimizer.step()
+    elapsed = time.perf_counter() - start
+    model.eval()
+    with torch.no_grad():
+        domain_loss = nn.functional.mse_loss(model(val_x), val_y).item()
+        old_loss = nn.functional.mse_loss(model(val_x), old_val_y).item()
+    report = {'method': method, 'trainable': sum(p.numel() for p in model.parameters() if p.requires_grad),
+              'steps': 100, 'example_exposures': 3200, 'domain_validation_mse': domain_loss,
+              'old_behavior_mse': old_loss, 'training_seconds_cpu': elapsed, 'lr': lr}
+    reports.append(report)
+    print(report)
 ```
 
-Le full FT gagne 2 domaine mais perd 7 général dans cet exemple fictif. Le “meilleur” dépend alors du cahier des charges.
+Le nombre entraînable doit être **32 pour LoRA** et **64 pour FullFT**. Chaque branche effectue **100 updates** et **3 200 expositions d’exemples**.
 
-## Formules et notation utiles
+La loss de domaine doit devenir petite pour cette correction facile. L’ancienne sortie peut se dégrader parce que nous demandons un changement incompatible avec son maintien exact. Il n’y a pas de vainqueur universel prédéfini.
 
-Rapporte : `domain_delta`, `general_delta`, `cost_ratio`, et éventuellement gain domaine par GB/heure uniquement comme indicateur secondaire.
+Les temps CPU du pilote incluent des effets de première utilisation et de petite taille. Ils montrent comment collecter une durée, pas une comparaison de performances GPU robuste. Les deux LR sont annoncés, mais n’ont pas été optimisés selon une étude de tuning : la portée de ce pilote reste limitée.
 
-## Code minimal observable
+## 5. Construire la vraie comparaison
 
-```text
-Ablation matrix
----------------
-Data        : identical
-Base model  : identical revision
-Tokens seen : matched
-Benchmark   : identical
-LoRA LR     : tuned for LoRA
-Full FT LR  : tuned separately but documented
-Seeds       : repeat if feasible
-```
+1. Choisis une base qui tient en full FT avec les états et longueurs cibles.
+2. Fixe dataset, groupes, tokenizer, masque de loss et benchmark.
+3. Sauvegarde la baseline domaine et générale.
+4. Définis les réglages LoRA et FullFT avec un protocole de tuning annoncé.
+5. Lance des smoke tests et une vraie reprise de checkpoint dans chaque branche.
+6. Fixe le budget principal : cibles, tokens, temps ou compute selon la question ; rapporte les autres.
+7. Choisis les checkpoints sur validation selon les mêmes contraintes de résultat.
+8. Évalue le test réservé, les régressions, la mémoire, le temps et le stockage.
 
-## Laboratoire guidé
+Le budget de la comparaison inclut les recherches d’hyperparamètres si tu présentes des recettes optimisées, pas seulement le meilleur run conservé.
 
-1. Vérifie mémoire full FT sur 2–5 steps.  
-2. Lance LoRA et full FT avec checkpoints réguliers.  
-3. Choisis chaque meilleur checkpoint sur validation, pas le dernier automatiquement.  
-4. Évalue test domaine et regression général.  
-5. Compare l’évolution du forgetting par checkpoint si possible.  
-6. Écris une recommandation selon trois scénarios de ressources.
+## 6. Tableau de livraison
 
-## Ce que tu dois observer
+| Dimension | À rapporter pour chaque branche |
+| --- | --- |
+| Qualité | Domaine, catégories générales, effectifs et incertitude utile |
+| Updates | Cibles exposées, batch logique, nombre de steps, scheduler |
+| Paramètres | Total, entraînable et liste des modules |
+| Ressources | Pic par appareil/rank, durée, débit et matériel |
+| Artefacts | Adapter/base requis ou poids complets, tokenizer, config |
+| Reprise | États conservés et procédure testée |
 
-- Full FT peut améliorer certaines tâches mais suradapter plus vite.
-- Le LR optimal des deux méthodes diffère souvent.
-- Le coût disque/opérationnel des checkpoints complets compte aussi.
+La taille d’un adapter ne doit pas être comparée au dossier complet d’un modèle sans indiquer que la base reste nécessaire à son usage.
 
-## À ne pas confondre
+## 7. Interpréter un résultat
 
-- Même budget de steps ≠ mêmes paramètres modifiés.
-- Meilleur train loss full FT ≠ meilleure généralisation.
-- LoRA plus petit ≠ nécessairement moins bon.
+Un gain d’un point domaine peut être utile ou négligeable selon variance, catégorie, coût et exigences. Une meilleure loss train ne remplace ni validation ni benchmark de régression.
 
-## Erreurs fréquentes
+Un FullFT qui ne tient pas au budget prévu donne une limite de faisabilité. Ne présente pas son absence de run comme une mesure de qualité inférieure ; adapte la taille ou rapporte la condition non exécutée.
 
-- Full FT sur un modèle trop gros et OOM à mi-run.
-- Utiliser le même LR “pour être fair” alors qu’il est inadapté à une condition.
-- Évaluer uniquement le domaine.
+## 8. Exercices avec corrigés
 
-## Exercices
+### Exercice 1 — Nombre de paramètres
 
-1. Définis ce qui doit rester identique et ce qui peut être tune séparément.
-2. Écris un critère d’acceptation incluant forgetting.
-3. Explique quand un gain de 1 point peut ou non justifier 2× VRAM.
+Pourquoi LoRA ajoute-t-il 32 poids pour 8→8 et r=2 ?
 
-## Validation — avant de continuer
+<details>
+<summary>Corrigé</summary>
 
-Tu dois pouvoir, sans simplement réciter le code :
+`2×(8+8)=32`, tandis que la matrice complète contient 64 poids hors biais.
 
-- Exécuter les deux méthodes de façon sûre.
-- Rapporter coût + qualité + forgetting.
-- Choisir les checkpoints par validation.
-- Écrire une recommandation conditionnelle.
+</details>
+
+### Exercice 2 — Cible facile
+
+Le succès de LoRA sur cette correction de rang 1 prouve-t-il son égalité au full FT sur toutes les tâches ?
+
+<details>
+<summary>Corrigé</summary>
+
+Non. Nous avons construit un cas que sa capacité peut représenter. Une autre correction, les données ou l’optimisation peuvent changer le résultat.
+
+</details>
+
+### Exercice 3 — Équité
+
+Pourquoi autoriser des LR distincts dans une comparaison de recettes ?
+
+<details>
+<summary>Corrigé</summary>
+
+Les méthodes ont des dynamiques différentes. Il faut annoncer un budget de tuning comparable plutôt qu’imposer un réglage inadapté à l’une.
+
+</details>
+
+### Exercice 4 — Conclusion
+
+FullFT gagne deux points mais dépasse un seuil fixé de régression générale. Le meilleur score domaine suffit-il à l’accepter ?
+
+<details>
+<summary>Corrigé</summary>
+
+Non, si ce seuil est une exigence du projet. Rapporte le gain et l’échec de contrainte, puis décide ou révise le besoin explicitement.
+
+</details>
+
+## 9. Critères de fin
+
+- [ ] Les branches partent du même état et les budgets sont annoncés.
+- [ ] La question ablation/recette optimisée est claire.
+- [ ] Les paramètres et coûts complets sont mesurés.
+- [ ] Le choix de checkpoint ne dépend pas du test final.
+- [ ] Domaine et capacités à préserver sont rapportés ensemble.
+- [ ] La recommandation reste conditionnelle aux données et ressources observées.
 
 ## Fiche mémo
 
-Comparer LoRA/full FT apprend à penser en **gain marginal contre liberté et coût supplémentaires**.
+```text
+Comparer le gain marginal à la liberté, au coût et aux régressions supplémentaires.
+```
 
-## Lien avec le module suivant
-
-Le projet 4 teste si une étape de continued pretraining apporte quelque chose avant SFT.
-
----
-
-> **Règle de progression :** si un point de la validation n’est pas clair, refais le micro-exemple et le laboratoire. Le but est de construire un modèle mental solide, pas d’accumuler des commandes.
+Le [projet 59](59_projet_4_continued_pretraining.md) isole une étape de continued pretraining.

@@ -1,143 +1,177 @@
-# Module 60 — Projet 5 — DPO
+# Module 60 — Projet 5 : vérifier la préférence apprise par DPO
 
-## Pourquoi ce module arrive ici
+## 1. Ce que tu vas construire
 
-Ce projet vérifie si des préférences pairwise améliorent un comportement au-delà du SFT. L’accent est mis sur la qualité des paires et l’absence de raccourcis.
+Une policy SFT sert de départ à une optimisation de préférences. Le projet doit montrer si la préférence voulue progresse sans se réduire à un indice de style ou à une marge sur le train.
 
-## Objectifs
+Tu vas auditer les paires, relire les marges et générations d’un pilote existant, puis définir une vraie comparaison indépendante.
 
-Construire un dataset de préférences audité, entraîner DPO, mesurer pairwise win rate et vérifier que le gain de préférence n’abîme pas exactitude, diversité ou capacités générales.
+**Prérequis :** modules 27 à 29, 53 à 56.
 
-**Prérequis :** Les modules précédents.  
-**Temps indicatif :** 4 à 8 heures.  
-**Niveau :** Projet intégrateur
+**Temps indicatif :** analyse courte ; plusieurs heures pour annotation, training et évaluation réelle.
 
-## Définitions concrètes
+**Matériel :** PyTorch et Transformers pour le script. Exécute auparavant le laboratoire 28 depuis le même dossier : il crée `outputs/module28/final` et `reference`.
 
-### Preference objective
+## 2. Fixer une préférence principale
 
-**Définition concrète.** Critère précis que les paires représentent.
+« Plus clair sans perdre d’exactitude » demande des critères : répondre à la question, expliquer les termes utiles, éviter les détours inutiles, conserver les précisions nécessaires.
+
+Une réponse plus courte n’est pas toujours meilleure. Si chosen est systématiquement court et rejected toujours long, vérifie si les paires enseignent un raccourci.
+
+Conserve contexte commun, justification, source/groupe, désaccords et décision pour les deux mauvaises réponses. Sépare les groupes avant les reformulations.
+
+## 3. Deux évaluations à ne pas confondre
+
+| Mesure | Question |
+| --- | --- |
+| Marge DPO sur paires réservées | La policy a-t-elle changé l’ordre relatif à la référence sur ces réponses fixes ? |
+| Comparaison de générations | Les nouvelles réponses sont-elles préférées selon la rubrique, à prompts fixés ? |
+
+Une reward accuracy relative n’est pas un win rate de deux textes générés à l’aveugle. Les longueurs et log-probabilités brutes apportent encore d’autres informations.
+
+## 4. Laboratoire guidé — Recharger policy et référence du module 28
+
+Le script n’effectue pas de nouveaux updates : il audite les artefacts d’un entraînement déjà réalisé. La miniature et ses deux reformulations ne constituent pas un benchmark humain.
+
+```python
+import json
+from pathlib import Path
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+root = Path('outputs/module28')
+if not (root / 'reference').exists() or not (root / 'final').exists():
+    raise FileNotFoundError('Executer le laboratoire du module 28 depuis ce dossier.')
+tokenizer = AutoTokenizer.from_pretrained(root / 'final', local_files_only=True)
+reference = AutoModelForCausalLM.from_pretrained(root / 'reference', local_files_only=True).eval()
+policy = AutoModelForCausalLM.from_pretrained(root / 'final', local_files_only=True).eval()
+cases = [
+    {'id': 'p1', 'prompt': 'question batch signifie quoi reponse ',
+     'chosen': 'groupe exemples <eos>', 'rejected': 'poids <eos>'},
+    {'id': 'p2', 'prompt': 'question gradient signifie quoi reponse ',
+     'chosen': 'derivee loss <eos>', 'rejected': 'change valeur <eos>'},
+]
 
 
-**Exemple simple.** Concision sans perte d’exactitude.
-
-### Preference holdout
-
-**Définition concrète.** Paires non vues pour mesurer l’ordre choisi/rejected.
-
-
-**Exemple simple.** Validation/test.
-
-### Style shortcut
-
-**Définition concrète.** Indice superficiel corrélé au chosen.
+def logp(model, prompt, answer):
+    prefix = tokenizer.encode(prompt, add_special_tokens=False)
+    inputs = tokenizer(prompt + answer, return_tensors='pt', add_special_tokens=False)
+    if inputs['input_ids'][0, :len(prefix)].tolist() != prefix:
+        raise ValueError('Frontiere tokenisee non compatible avec cette methode de masque')
+    with torch.no_grad():
+        logits = model(**inputs).logits[:, :-1].float()
+        ids = inputs['input_ids'][:, 1:]
+        token_logps = logits.log_softmax(-1).gather(-1, ids.unsqueeze(-1)).squeeze(-1)
+    return token_logps[:, len(prefix)-1:].sum().item()
 
 
-**Exemple simple.** Chosen toujours plus long.
-
-### Win rate
-
-**Définition concrète.** Fraction de comparaisons remportées selon un juge/protocole.
-
-
-**Exemple simple.** DPO vs SFT en comparaison aveugle.
-
-## Intuition simple
-
-La difficulté n’est pas de lancer DPO; c’est de garantir que les paires enseignent **la préférence voulue** plutôt qu’un indice facile à exploiter.
-
-## Ce qui se passe réellement sous le capot
-
-1. Choisir un seul objectif préférence principal.
-2. Créer chosen/rejected proches mais distinguables par ce critère.
-3. Auditer longueur, format et mots-clés.
-4. Séparer train/validation/test.
-5. Mesurer modèle SFT sur préférence holdout.
-6. Entraîner DPO avec beta/LR documentés.
-7. Réévaluer préférence, benchmark général et statistiques de longueur.
-8. Faire un pairwise blind si le critère est qualitatif.
-
-## Exemple minimal à comprendre mentalement
-
-Objectif : concision correcte. Une mauvaise paire serait chosen=100 mots corrects, rejected=5 mots faux : le modèle peut apprendre “long=bon”. Une meilleure paire garde les deux réponses factuellement correctes mais chosen est plus concise selon la rubrique.
-
-## Formules et notation utiles
-
-Rapporte au minimum :
-
-```text
-preference_accuracy_before/after
-mean_length_before/after
-general_score_before/after
+records = []
+for case in cases:
+    pc = logp(policy, case['prompt'], case['chosen'])
+    pr = logp(policy, case['prompt'], case['rejected'])
+    rc = logp(reference, case['prompt'], case['chosen'])
+    rr = logp(reference, case['prompt'], case['rejected'])
+    record = {'id': case['id'], 'raw_policy_margin': pc - pr,
+              'relative_margin': (pc - rc) - (pr - rr),
+              'chosen_tokens': len(tokenizer.encode(case['chosen'], add_special_tokens=False)),
+              'rejected_tokens': len(tokenizer.encode(case['rejected'], add_special_tokens=False))}
+    records.append(record)
+    print(record)
+print('Preference relative stricte :', sum(row['relative_margin'] > 0 for row in records), '/', len(records))
+output = Path('outputs/project60')
+output.mkdir(parents=True, exist_ok=True)
+(output / 'pair_audit.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in records), encoding='utf-8')
 ```
 
-Si preference accuracy monte mais longueur explose, inspecte un shortcut.
+Les marges relatives du pilote 28 doivent être positives, avec les limites déjà indiquées. La marge brute peut raconter un ordre différent car elle ne retire pas la référence.
 
-## Code minimal observable
+Le contrôle de préfixe est important : avec un vrai tokenizer, encoder prompt puis concaténer une réponse ne garantit pas toujours une frontière identique à l’encodage complet. Utilise la préparation du trainer/template et vérifie les cibles réelles.
 
-```text
-Preference audit checklist
---------------------------
-[ ] same prompt/context
-[ ] chosen truly preferred
-[ ] rejected plausible
-[ ] length distributions inspected
-[ ] formatting artifacts inspected
-[ ] reasons/rubric documented
-[ ] holdout independent
-```
+## 5. Réaliser le projet complet
 
-## Laboratoire guidé
+1. Choisis le checkpoint SFT et une référence identifiée.
+2. Fixe une grille, construis des paires utiles et audite les raccourcis.
+3. Prépare splits groupés et benchmark général indépendant.
+4. Archive avant DPO scores sur paires et générations sur prompts fixés.
+5. Inspecte les deux branches après tokenisation et leurs cibles actives.
+6. Lance un budget court puis une expérience avec beta, LR, variante et arrêt documentés.
+7. Évalue paires réservées, générations à l’aveugle et régressions.
+8. Teste la sauvegarde/reprise et conserve référence ou identité nécessaire.
 
-1. Crée 200 paires propres si possible, moins si tu veux seulement apprendre le pipeline.  
-2. Annoter `reason/category` hors champs utilisés pour le training.  
-3. Mesure statistiques chosen vs rejected.  
-4. Baseline SFT.  
-5. DPO court.  
-6. Évalue preference holdout + general.  
-7. Inspecte les 20 plus grands changements de probabilité/comportement.
+Une comparaison supplémentaire SFT sur chosen peut aider à attribuer ce qui vient de l’objectif pairwise, sous un budget clairement annoncé.
 
-## Ce que tu dois observer
+## 6. Juger les générations indépendamment
 
-- La qualité des rejected est cruciale.
-- Le modèle peut apprendre des artefacts plus vite que le concept visé.
-- Un DPO très fort peut homogénéiser le style.
+Randomise l’ordre A/B et masque les noms des modèles. La grille doit pouvoir noter égalités et deux mauvaises réponses. Si un juge LLM est utilisé, mesure son accord sur un sous-ensemble humain et cherche biais de style, longueur et position.
 
-## À ne pas confondre
+Rapporte wins/ties/losses, effectifs, métriques factuelles et distributions de longueur. Un gain de win rate n’est pas une preuve universelle de vérité.
 
-- Win rate ≠ vérité factuelle.
-- DPO ≠ reward model.
-- Plus de marge chosen/rejected ≠ toujours meilleur modèle.
+Si le même juge a produit les labels et fournit l’unique évaluation finale, il peut surtout confirmer ses propres biais. Prévois un contrôle indépendant pertinent.
 
-## Erreurs fréquentes
+## 7. Livrables et décision
 
-- Rejected absurdes.
-- Chosen systématiquement plus long/court.
-- Utiliser le même juge exact comme source des paires et seule validation.
+Remets paires avec audit hors champs d’apprentissage, configurations, référence, policy/adapters, tokenizer, logs, sorties brutes et tableau par critère.
 
-## Exercices
+Fixe un seuil de préférence et des limites de régression avant le run. Conserve aussi une expérience qui échoue : elle peut révéler une annotation incohérente, une troncature ou un objectif trop étroit.
 
-1. Conçois trois paires “difficiles” pour une préférence claire.
-2. Liste cinq shortcuts à mesurer.
-3. Définis un critère d’arrêt si le général régresse.
+## 8. Exercices avec corrigés
 
-## Validation — avant de continuer
+### Exercice 1 — Deux marges
 
-Tu dois pouvoir, sans simplement réciter le code :
+Pourquoi une marge relative positive ne signifie-t-elle pas forcément logp(chosen)>logp(rejected) ?
 
-- Auditer les paires.
-- Mesurer préférence avant/après.
-- Mesurer les changements de style/longueur.
-- Conserver un benchmark général.
+<details>
+<summary>Corrigé</summary>
+
+Elle mesure le changement d’écart par rapport à la référence. La préférence brute de départ peut être différente et ne pas avoir encore été inversée.
+
+</details>
+
+### Exercice 2 — Longueur
+
+Chosen toujours plus long est-il un bon corpus pour apprendre automatiquement la précision ?
+
+<details>
+<summary>Corrigé</summary>
+
+Pas sans audit : la longueur peut devenir un raccourci. Construis des cas où elle varie sans déterminer mécaniquement la préférence.
+
+</details>
+
+### Exercice 3 — Win rate
+
+La reward accuracy DPO est-elle le taux de victoire de générations nouvelles ?
+
+<details>
+<summary>Corrigé</summary>
+
+Non. Elle porte couramment sur des scores relatifs de réponses fixes ; la comparaison de nouvelles générations utilise un autre protocole.
+
+</details>
+
+### Exercice 4 — Référence
+
+Pourquoi conserver son identité exacte dans les résultats ?
+
+<details>
+<summary>Corrigé</summary>
+
+Les marges relatives et l’objectif dépendent de ses log-probabilités. Une autre référence change leur sens même à policy identique.
+
+</details>
+
+## 9. Critères de fin
+
+- [ ] La préférence et les cas ambigus sont définis.
+- [ ] Les paires et frontières tokenisées sont auditées.
+- [ ] Les scores relatifs et générations sont évalués séparément.
+- [ ] Les métriques de longueur et régression accompagnent la préférence.
+- [ ] Policy, référence, config et sorties sont rechargeables et traçables.
 
 ## Fiche mémo
 
-DPO est réussi lorsque la **préférence voulue**, et non un proxy superficiel, s’améliore.
+```text
+Apprendre la préférence visée, puis la vérifier sur autre chose que la loss optimisée.
+```
 
-## Lien avec le module suivant
-
-Le projet 6 ajoute une boucle online avec reward vérifiable et GRPO ou autre policy optimization adaptée.
-
----
-
-> **Règle de progression :** si un point de la validation n’est pas clair, refais le micro-exemple et le laboratoire. Le but est de construire un modèle mental solide, pas d’accumuler des commandes.
+Le [projet 61](61_projet_6_rl_verifiable.md) ajoute une collecte online avec oracle.
